@@ -54,9 +54,7 @@ The post-load Marlin repack logs `CUDACachingAllocator ... OOM` warnings; they a
 
 **3. Base tuning.** `--max-num-batched-tokens 4096 → 1024` is free (the Marlin W4A16 MoE is weight-bandwidth-bound) and buys
 ~30k KV tokens. The MTP head costs 2 GiB/GPU — rejected. `--max-model-len -1` (auto-fit) OOMs because the sparse-indexer buffers
-scale from the 1M declared max. The vendor's own image (`madeby561/vllm:glm53-jj…`, B12X attention/MoE path) loads with its own
-mixed-precision overlay but is **2× slower on SM120** (50 vs 107 tok/s, 2.4k vs 5.5k prefill) regardless of `FORCE_A16`, and its
-PCIe all-reduce arm gives **0 draft acceptance** — parked as a DFlash reference only.
+scale from the 1M declared max.
 
 **4. DFlash-2 — `patches/dflash2/`, `cstech-attn/`, `cstech-kv/`.** The image's fork predates upstream **vLLM PR #52816**
 (DFlash-2 model + speculator); applied with `patch -F3`, two fuzz hunks hand-fixed (registry entry placement; DFlash2 dispatch
@@ -155,14 +153,14 @@ docker run --rm --name glm53-flash --gpus all --network host --ipc host --init -
 | `cstech-offload/{config,scheduler}.py` | `kv_connector/v1/offloading/` | inert-in-position KV groups for host-RAM offload |
 
 ## Dead ends (so you don't repeat them)
-Vendor jj image (2× slower on SM120; its PCIe all-reduce kills speculation) · MTP head (2 GiB/GPU) · `--max-model-len -1` ·
+MTP head (2 GiB/GPU) · `--max-model-len -1` ·
 `--gpu-memory-utilization` above 0.988 (no headroom under load) · `--kv-cache-memory` ≥ 4.3 GiB at 384k/8 · packing KDA state
 pages into MLA sub-slots (181 MiB ceiling — 4 KDA groups × (2+K) block ids is the real cost) · the "one spec block per K" Mamba
 shortcut (the KDA backend needs one state column per speculative token; silent corruption) · `--mamba-block-size 14336` for
 offload RAM efficiency (works, 1.5× less RAM, but partial hash hits are off on this stack so RAM hits floor at 14,336 tokens).
 Two latent offload defects are documented in `cstech-offload/` (hit rounded to the Mamba align before the MLA convergence loop;
-`cache_config.block_size` used for the Mamba stride) — unmounted candidates alongside. The refuted / diagnostic / vendor-image
-overlays from the build are not in this repo.
+`cache_config.block_size` used for the Mamba stride) — unmounted candidates alongside. The refuted / diagnostic overlays from the
+build are not in this repo.
 
 ## Measuring
 `tools/glm_bench.py <label>` (cold prefill 4k/16k/64k + decode C1/C2/C4 → `results/bench_results.jsonl`), `tools/glm_stress.py` /
