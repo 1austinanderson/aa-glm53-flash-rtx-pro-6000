@@ -2,7 +2,7 @@
 
 Two RTX PRO 6000 Blackwell Workstation cards (96 GB each, SM120) on PCIe Gen5, TP2, no NVLink. Result: GLM-5.3-Flash at a
 **384k-token context window**, DFlash-2 speculative decoding, **~150 tok/s single-stream / ~355 tok/s at 4 streams**,
-**~5.1k tok/s prefill**, served through stock vLLM OpenAI endpoints. Everything below is what it actually took, in order, with the
+**~5.1k tok/s prefill**, served over the usual OpenAI-compatible API. Everything below is what it actually took, in order, with the
 failure that motivated each step. All patches are small bind-mounted overlays on a public image — nothing is rebuilt from source.
 **This repo is the recipe:** `serve.sh` + `patches/` reproduce the serving stack; `tools/` holds the drafter quantizer and the
 bench/stress scripts; `results/` the measured rows.
