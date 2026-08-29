@@ -7,6 +7,40 @@ failure that motivated each step. All patches are small bind-mounted overlays on
 **This repo is the recipe:** `serve.sh` + `patches/` reproduce the serving stack; `tools/` holds the drafter quantizer and the
 bench/stress scripts; `results/` the measured rows.
 
+## Where the 96 GB goes (per GPU, TP2)
+`nvidia-smi` shows 95.6 GiB per card; 93.99 GiB is free at start (CUDA context takes the rest). The weights alone leave ~8 GiB
+for everything else, which is why every later step is about buying back a few hundred MiB.
+
+```
+per GPU                                                                            GiB
+model weights (TP2 shard, after Marlin repack)  ████████████████████████████████████████████████  85.96
+KV cache (fp8, explicit --kv-cache-memory)      ██                                                3.8
+activation reserve (peak, MNBT 1024)            █▌                                               ~3.0
+DFlash-2 drafter (FP8 MLP-only, W8A16)          ▌                                                ~1.0   (bf16 drafter: 1.47)
+non-torch (NCCL, FlashInfer, allocator)         ▍                                                 0.70
+CUDA graphs (piecewise + full + DFlash)         ▏                                                 0.15
+sparse-indexer prefill workspace (after cap)    ▏                                                 0.06   (1.98 before the cap)
+                                                                                          ───────
+                                                                                          ~94.7 of 93.99 usable → min free 8 MiB on a full-window request
+```
+
+What the 174.73 GiB checkpoint is made of (both GPUs together; `safetensors` headers, 258,757 tensors):
+
+```
+routed experts   NVFP4 (U8 packed + E4M3 scales)  ██████████████████████████████████████████████  163.27  93.4%
+attention        KDA + MLA projections, MXFP8      ██                                                5.89   3.4%
+embed / lm_head  BF16                              ▌                                                 2.36   1.4%
+vision encoder   BF16 (Glm5Next multimodal tower)  ▎                                                 1.05   0.6%
+shared experts   MXFP8                             ▎                                                 1.04   0.6%
+dense MLP        BF16 (first-k dense layers)       ▎                                                 0.94   0.5%
+norms / gates / mHC                                ▏                                                 0.10   0.1%
+sparse indexer   MXFP8 (wk/weights_proj → BF16)    ▏                                                 0.09   0.1%
+```
+
+So: 93% of the card is the MoE experts, the vision tower is a rounding error, and the two things you can actually trade against
+each other are the KV claim (3.8 GiB) and the activation reserve — DFlash costs ~1 GiB of weights plus ~518 MiB of KV per
+concurrent request (4 KDA groups × (2+K) block ids at K=3), which is the real concurrency limiter, not KV bytes.
+
 ## Ingredients
 - **Checkpoint:** `local-inference-lab/GLM-5.3-Flash-NVFP4-4p67` (174.75 GiB). ModelOpt MIXED_PRECISION: routed experts
   W4A16-NVFP4 g16, **attention + shared experts + sparse indexer MXFP8 g32**, dense MLP / embeddings / lm_head BF16.
