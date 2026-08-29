@@ -5,7 +5,7 @@
 tokenizer and capped under max-model-len. Usage: glm_bench.py <label> [base] [ctx]"""
 import json, random, sys, time, threading, urllib.request
 label = sys.argv[1] if len(sys.argv) > 1 else "run"
-BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:12921/v1"
+BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8000/v1"
 CTX = int(sys.argv[3]) if len(sys.argv) > 3 else 65536
 WORDS = ("margin deposit yield accrual duration basis credit tier lease swap covenant tranche "
          "spread ledger accretion charter reserve capital syndicate warrant collar equity "

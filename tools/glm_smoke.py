@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Smoke battery for GLM-5.3-Flash on :12921 — reasoning split, tool call, decode speed."""
+"""Smoke battery for GLM-5.3-Flash on :8000 — reasoning split, tool call, decode speed."""
 import json, sys, time, urllib.request
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:12921"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 def post(path, body, timeout=600):
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     t0 = time.time(); r = json.load(urllib.request.urlopen(req, timeout=timeout)); return r, time.time() - t0

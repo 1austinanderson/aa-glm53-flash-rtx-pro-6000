@@ -13,7 +13,7 @@ REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CACHE_DIR="${CACHE_DIR:-$REPO_DIR/cache}"
 IMAGE="${IMAGE:-glm53-cstech-it:20260828}"
 LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
-PORT="${PORT:-12921}"; GPUS="${GPUS:-0,1}"; CTX="${CTX:-393216}"; SEQS="${SEQS:-8}"; MNBT="${MNBT:-1024}"; UTIL="${UTIL:-0.988}"
+PORT="${PORT:-8000}"; GPUS="${GPUS:-0,1}"; CTX="${CTX:-393216}"; SEQS="${SEQS:-8}"; MNBT="${MNBT:-1024}"; UTIL="${UTIL:-0.988}"
 KV_MEM_BYTES="${KV_MEM_BYTES:-4080218931}"   # 3.8 GiB explicit claim; 0 = let vLLM profile from UTIL
 K="${K:-3}"; DRAFTER="${DRAFTER:-/root/models/incoai/GLM-5.3-Flash-DFlash2-FP8}"
 OFFLOAD_GIB="${OFFLOAD_GIB:-32}"; SHM="${SHM:-48gb}"

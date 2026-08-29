@@ -5,7 +5,7 @@ and a mixed burst, while sampling nvidia-smi peak used + vLLM metrics.
 Usage: glm_stress.py <label> [base] [ctx]"""
 import base64, json, random, subprocess, sys, threading, time, urllib.request, zlib, struct
 label = sys.argv[1] if len(sys.argv) > 1 else "run"
-BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:12921/v1"
+BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8000/v1"
 CTX = int(sys.argv[3]) if len(sys.argv) > 3 else 131072
 MODEL = json.load(urllib.request.urlopen(BASE + "/models"))["data"][0]["id"]
 WORDS = "margin deposit yield accrual duration basis credit tier lease swap covenant tranche spread ledger".split()

@@ -164,7 +164,7 @@ docker run --rm --name glm53-flash --gpus all --network host --ipc host --init -
   -e INSTANTTENSOR_BACKEND=BUFFERED -e SAFETENSORS_FAST_GPU=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_LOGGING_LEVEL=INFO \
   glm53-cstech-it:20260828 /root/models/local-inference-lab/GLM-5.3-Flash-NVFP4-4p67 \
-  --served-model-name GLM-5.3-Flash --host 0.0.0.0 --port 12921 --tensor-parallel-size 2 \
+  --served-model-name GLM-5.3-Flash --host 0.0.0.0 --port 8000 --tensor-parallel-size 2 \
   --max-num-batched-tokens 1024 --max-num-seqs 8 --max-model-len 393216 --gpu-memory-utilization 0.988 \
   --kv-cache-dtype fp8 --load-format instanttensor --enable-prefix-caching --no-enable-flashinfer-autotune \
   --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45 --kv-cache-memory 4080218931 \
@@ -199,10 +199,10 @@ build are not in this repo.
 ## Measuring
 `tools/glm_bench.py <label>` (cold prefill 4k/16k/64k + decode C1/C2/C4 → `results/bench_results.jsonl`), `tools/glm_stress.py` /
 `tools/glm_stress_heavy.py` (→ `results/stress_results.jsonl`), `tools/pcie_probe.sh` (nvidia-smi dmon rx/tx/SM during prefill),
-`tools/glm_smoke.py` (needle + acceptance check). All assume `127.0.0.1:12921`. External:
+`tools/glm_smoke.py` (needle + acceptance check). All default to `http://127.0.0.1:8000` and take a base URL as an argument. External:
 [`local-inference-lab/llm-inference-bench`](https://github.com/local-inference-lab/llm-inference-bench)
 (`--test-profile estonia`; `--skip-prefill --contexts 0 --concurrency 1,2,4 --max-tokens 4096`; `--prefill-only --prefill-contexts 4k,16k,64k`).
-Speculation health: `curl :12921/metrics | grep spec_decode`. KV pool: `docker logs glm53-flash 2>&1 | grep "GPU KV cache size"`.
+Speculation health: `curl :8000/metrics | grep spec_decode`. KV pool: `docker logs glm53-flash 2>&1 | grep "GPU KV cache size"`.
 `results/bench_results.jsonl` carries every sweep row from the build with its config label (image / spec / ctx / seqs / MNBT / util).
 
 ## Layout

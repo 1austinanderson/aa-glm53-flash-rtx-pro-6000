@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Heavy stress for GLM-5.3-Flash on :12921 (DFlash + RAM offload). Usage: glm_stress_heavy.py <label> [base] [ctx]"""
+"""Heavy stress for GLM-5.3-Flash on :8000 (DFlash + RAM offload). Usage: glm_stress_heavy.py <label> [base] [ctx]"""
 import base64, json, random, subprocess, sys, threading, time, urllib.request, zlib, struct
-label = sys.argv[1] if len(sys.argv) > 1 else "heavy"; BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:12921/v1"; CTX = int(sys.argv[3]) if len(sys.argv) > 3 else 393216
+label = sys.argv[1] if len(sys.argv) > 1 else "heavy"; BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8000/v1"; CTX = int(sys.argv[3]) if len(sys.argv) > 3 else 393216
 MODEL = json.load(urllib.request.urlopen(BASE + "/models"))["data"][0]["id"]
 W = "margin deposit yield accrual duration basis credit tier lease swap covenant tranche spread ledger accretion charter reserve".split()
 peak = {"used": 0, "minfree": 10**9, "shm": 0, "stop": False}

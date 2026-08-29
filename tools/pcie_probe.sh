@@ -1,5 +1,5 @@
 #!/bin/bash
-# PCIe/SM probe during prefill + decode on :12921. Samples nvidia-smi dmon (rx/tx MB/s, SM%) at 1 Hz.
+# PCIe/SM probe during prefill + decode on :8000. Samples nvidia-smi dmon (rx/tx MB/s, SM%) at 1 Hz.
 set -u
 OUT=results/pcie_probe_$(date +%Y%m%d-%H%M%S).log
 nvidia-smi --query-gpu=index,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader | head -2
@@ -7,7 +7,7 @@ nvidia-smi dmon -i 0,1 -s tu -d 1 -o T > "$OUT.dmon" 2>&1 &
 DM=$!; sleep 3
 python3 - "$OUT" <<'PY'
 import json,random,sys,time,threading,urllib.request
-B="http://127.0.0.1:12921/v1"; out=sys.argv[1]
+B="http://127.0.0.1:8000/v1"; out=sys.argv[1]
 W="margin deposit yield accrual duration basis credit tier lease swap covenant tranche spread ledger".split()
 def req(b): return json.load(urllib.request.urlopen(urllib.request.Request(B+"/chat/completions",json.dumps(b).encode(),{"Content-Type":"application/json"}),timeout=900))
 marks=[]
