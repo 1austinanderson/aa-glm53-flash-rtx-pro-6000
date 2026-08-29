@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cache/
+*.log
+*.log.dmon
+*.log.marks
+.venv/

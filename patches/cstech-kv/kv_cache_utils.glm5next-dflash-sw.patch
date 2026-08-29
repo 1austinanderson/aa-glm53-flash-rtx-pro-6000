@@ -1,0 +1,250 @@
+--- kv_cache_utils.pristine.py	2026-08-28 02:23:18.905043453 -0400
++++ kv_cache_utils.py	2026-08-28 02:28:30.511619648 -0400
+@@ -980,10 +980,12 @@
+     ):
+         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
+     if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+-        # GLM-5-Next hybrid slot sharing: mamba layers co-own the MLA slot
+-        # tensors, and tail layers co-own the indexer slot tensors, so a block
+-        # costs one MLA page per MLA slot plus one indexer page per indexer
+-        # slot (the tail rides inside the indexer page via slot-sharing).
++        # GLM-5-Next hybrid slot sharing: mamba layers (and a DFlash drafter's
++        # sliding-window layers) co-own the MLA slot tensors, and tail layers
++        # co-own the indexer slot tensors, so a block costs one MLA page per
++        # MLA slot plus one indexer page per indexer slot (the tail rides
++        # inside the indexer page via slot-sharing). Slot groups add block-id
++        # demand, never bytes per block.
+         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
+         return len(mla_names) * mla_page + len(idx_names) * idx_page
+     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
+@@ -1085,6 +1087,23 @@
+         return kv_cache_spec
+ 
+     max_page_size = max(page_sizes)
++    try:
++        _agg: dict = {}
++        for _n, _sp in kv_cache_spec.items():
++            _k = (
++                type(_sp).__name__,
++                getattr(_sp, "block_size", None),
++                _sp.page_size_bytes,
++                getattr(_sp, "page_size_padded", None),
++            )
++            _agg[_k] = _agg.get(_k, 0) + 1
++        for _k, _c in _agg.items():
++            logger.info(
++                "KVDIAG unify: %s x%d block=%s page=%d padded=%s (max_page=%d)",
++                _k[0], _c, _k[1], _k[2], _k[3], max_page_size,
++            )
++    except Exception as e:  # noqa: BLE001
++        logger.info("KVDIAG unify failed: %r", e)
+     new_kv_cache_spec = {}
+     for layer_name, layer_spec in kv_cache_spec.items():
+         if layer_spec.page_size_bytes == max_page_size:
+@@ -1398,6 +1417,38 @@
+     return num_groups
+ 
+ 
++def _glm5_next_sw_block_size(
++    sw_spec: SlidingWindowSpec, mla_page: int, mla_block: int
++) -> int:
++    """Block size for a draft model's sliding-window layers under the
++    GLM-5-Next layout.
++
++    Two hard constraints, both about *sharing a block id space* with the
++    MLA/mamba slot tensors:
++
++    1. The SW page must fit the MLA page (it is padded up to it and read
++       through the runner's strided view), so ``block * bytes_per_token
++       <= mla_page``.
++    2. ``resolve_kv_cache_block_sizes`` takes the LCM of every group's
++       block size as the scheduler's token-alignment invariant, and the
++       GCD as the prefix-cache hash granularity. A block size that is not
++       a divisor of the MLA block explodes the LCM (e.g. 3584 vs 1136 ->
++       254,464 tokens, larger than max_model_len) and collapses the GCD to
++       16. So take the largest *divisor* of the MLA block that fits, and
++       keep it a multiple of 16 for the kernels.
++
++    Returns 0 if no such block size exists.
++    """
++    per_token = sw_spec.real_page_size_bytes // sw_spec.block_size
++    if per_token <= 0:
++        return 0
++    limit = min(mla_block, mla_page // per_token)
++    for cand in range(limit // 16 * 16, 0, -16):
++        if mla_block % cand == 0:
++            return cand
++    return 0
++
++
+ def _get_kv_cache_groups_glm5_next(
+     vllm_config: VllmConfig,
+     kv_cache_spec: dict[str, KVCacheSpec],
+@@ -1411,10 +1462,18 @@
+     tail_specs = {
+         k: v for k, v in kv_cache_spec.items() if isinstance(v, KpoolTailSpec)
+     }
++    # A speculative drafter (e.g. DFlash-2) adds plain sliding-window layers on
++    # top of the GLM-5-Next hybrid. They are not MLA, so they must be split off
++    # before the "everything else is MLA" check below; they get their own group
++    # that co-owns the MLA slot tensors, exactly like a mamba group.
++    sw_specs = {
++        k: v for k, v in kv_cache_spec.items() if type(v) is SlidingWindowSpec
++    }
+     attn_specs = {
+         k: v
+         for k, v in kv_cache_spec.items()
+         if not isinstance(v, (MambaSpec, KpoolTailSpec))
++        and type(v) is not SlidingWindowSpec
+     }
+     if not mamba_specs or not all(
+         type(s) is MLAAttentionSpec for s in attn_specs.values()
+@@ -1453,6 +1512,38 @@
+         assert tail_uniform is not None
+         tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+ 
++    # Draft-model sliding-window group: one extra slot group. Its layers ride
++    # inside the MLA tensors at disjoint block ids (block ids are unique across
++    # groups), so it costs no extra bytes per block -- only block-id demand,
++    # ~4 blocks/request for a 2048-token window.
++    sw_group = None
++    if sw_specs:
++        any_sw = next(iter(sw_specs.values()))
++        if not all(spec == any_sw for spec in sw_specs.values()):
++            return None
++        if len(sw_specs) > len(mla_names):
++            # More SW layers than MLA slot tensors to hide in.
++            return None
++        mla_block = mla_specs[mla_names[0]].block_size
++        sw_block = _glm5_next_sw_block_size(any_sw, mla_page, mla_block)
++        if sw_block <= 0:
++            return None
++        padded_sw = replace(any_sw, block_size=sw_block, page_size_padded=mla_page)
++        if padded_sw.page_size_bytes != mla_page:
++            return None
++        logger.info(
++            "KVDIAG glm5next: %d sliding-window draft layer(s), block %d -> %d "
++            "(real page %d B padded to the %d B MLA page, %.1f%% slack), "
++            "sharing the MLA slot tensors",
++            len(sw_specs),
++            any_sw.block_size,
++            sw_block,
++            padded_sw.real_page_size_bytes,
++            mla_page,
++            100.0 * (mla_page - padded_sw.real_page_size_bytes) / mla_page,
++        )
++        sw_group = KVCacheGroupSpec(list(sw_specs), padded_sw)
++
+     any_mamba = next(iter(mamba_specs.values()))
+     assert all(spec == any_mamba for spec in mamba_specs.values())
+     if any_mamba.real_page_size_bytes > mla_page:
+@@ -1479,6 +1570,7 @@
+         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+         + ([tail_group] if tail_group is not None else [])
+         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
++        + ([sw_group] if sw_group is not None else [])
+     )
+ 
+ 
+@@ -1502,8 +1594,11 @@
+     paths can never disagree.
+ 
+     Returns:
+-      - (attn_group, mamba_groups, mla_names, idx_names, mla_page, idx_page,
++      - (attn_group, slot_groups, mla_names, idx_names, mla_page, idx_page,
+          tail_names, tail_page)
++        where ``slot_groups`` are the groups that co-own the MLA slot tensors:
++        the mamba groups, plus (with a DFlash-style drafter) the draft model's
++        sliding-window group.
+       - None if the group config is invalid
+     """
+     uniform_groups = [
+@@ -1514,6 +1609,12 @@
+     mamba_groups = [
+         g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+     ]
++    # A draft model's sliding-window group is padded to the MLA page and hides
++    # in the MLA slot tensors at disjoint block ids, exactly like mamba.
++    sw_groups = [
++        g for g in kv_cache_groups if type(g.kv_cache_spec) is SlidingWindowSpec
++    ]
++    slot_groups = mamba_groups + sw_groups
+     # Both the MLA(+indexer) attn group and the kpool tail group are
+     # UniformTypeKVCacheSpecs; distinguish by the inner spec type.
+     attn_group: KVCacheGroupSpec | None = None
+@@ -1526,7 +1627,7 @@
+             tail_group = g
+     if attn_group is None or not mamba_groups:
+         return None
+-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
++    if len(uniform_groups) + len(slot_groups) != len(kv_cache_groups):
+         return None
+     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+     if not all(
+@@ -1542,7 +1643,10 @@
+     if len(mla_pages) != 1 or len(idx_pages) != 1:
+         return None
+     mla_page = mla_pages.pop()
+-    if any(g.kv_cache_spec.page_size_bytes != mla_page for g in mamba_groups):
++    if any(g.kv_cache_spec.page_size_bytes != mla_page for g in slot_groups):
++        return None
++    if any(len(g.layer_names) > len(mla_names) for g in slot_groups):
++        # Every slot group layer needs its own MLA tensor to hide in.
+         return None
+     tail_names: list[str] = []
+     tail_page = 0
+@@ -1562,7 +1666,7 @@
+         tail_page = tail_pages.pop()
+     return (
+         attn_group,
+-        mamba_groups,
++        slot_groups,
+         mla_names,
+         idx_names,
+         mla_page,
+@@ -1618,7 +1722,8 @@
+         ]
+     elif (glm5n := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+         # GLM-5-Next hybrid slot sharing: one tensor per MLA layer, co-owned
+-        # by that MLA layer and one mamba layer from each mamba group; kpool
++        # by that MLA layer and one layer from each slot group (mamba groups,
++        # plus a DFlash drafter's sliding-window group if present); kpool
+         # indexer layers get per-layer tensors that are ALSO co-owned by their
+         # sibling tail layer (the tail parasitizes the indexer tensor at
+         # disjoint block-ids, like mamba parasitizes MLA, so no standalone tail
+@@ -1626,7 +1731,7 @@
+         # the MLA contiguous virtual split.
+         (
+             _,
+-            mamba_groups,
++            slot_groups,
+             mla_names,
+             idx_names,
+             mla_page,
+@@ -1648,7 +1753,7 @@
+             KVCacheTensor(
+                 size=mla_page * num_blocks,
+                 shared_by=[mla_name]
+-                + [g.layer_names[i] for g in mamba_groups if i < len(g.layer_names)],
++                + [g.layer_names[i] for g in slot_groups if i < len(g.layer_names)],
+             )
+             for i, mla_name in enumerate(mla_names)
+         ] + [
+@@ -2204,7 +2309,7 @@
+         # tensor.
+         (
+             attn_group,
+-            mamba_groups,
++            slot_groups,
+             mla_names,
+             idx_names,
+             mla_page,
+@@ -2215,7 +2320,7 @@
+         uniform_spec = attn_group.kv_cache_spec
+         assert isinstance(uniform_spec, UniformTypeKVCacheSpecs)
+         blocks_needed = uniform_spec.max_memory_usage_pages(vllm_config)
+-        for group in mamba_groups:
++        for group in slot_groups:
+             spec = group.kv_cache_spec
+             blocks_needed += cdiv(
+                 spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes

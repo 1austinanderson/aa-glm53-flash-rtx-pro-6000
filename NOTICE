@@ -1,0 +1,10 @@
+glm53-flash-rtx-pro-6000
+Copyright 2026 Austin Anderson
+
+Files under patches/ are modified copies of source files from vLLM
+(https://github.com/vllm-project/vllm, Apache License 2.0) as shipped in the
+cstechdev/vllm:glm53-flash-nope-sm120-cu130-20260826-r1 image, plus the
+DFlash-2 changes from vLLM pull request #52816. Each directory keeps the
+unmodified file (*.pristine.py / *.orig / glm5next.pristine/) and a diff
+alongside the modified one. Model checkpoints and the DFlash-2 drafter are
+NOT included; see README.md for their sources and licenses.

@@ -1,0 +1,33 @@
+CANDIDATE — NOT APPLIED. Trade-off decision for Austin (2026-08-28 10:15).
+
+Marks the DFlash-2 drafter's sliding-window KV group inert for CPU offloading,
+reusing the machinery already in place for the kpool tail group.
+
+Effect (from patches/cstech-offload/kv_offload_dryrun.py, `--no-drafter` row
+is the exact post-patch shape for the offload pool):
+  RAM per 60k prompt   146 chunks / 7.39 GiB  ->  80 chunks / 4.05 GiB  (1.82x)
+  store per 53,760 tok      4.205 GB          ->  3.104 GB
+  RAM-hit load              1.023 GB          ->  0.968 GB
+Cost: after an offload (RAM) hit the drafter's sliding window holds stale KV,
+so draft acceptance collapses to ~1.0/step until ~2048 tokens have been
+generated. Model OUTPUT is unaffected (rejection sampling preserves the target
+distribution), and GPU prefix-cache hits are unaffected. Apply only if Austin
+prefers reuse depth over post-hit draft acceptance; raising GLM_KV_OFFLOAD_GIB
+buys the same depth with no acceptance cost.
+
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -80,7 +80,13 @@
+         participates = getattr(spec, "participates_in_prefix_caching", True)
+         divisible = tokens_per_block % tokens_per_hash == 0
+-        if participates and divisible:
++        # A draft model's sliding-window group is 5 layers x 1,835,008 B of
++        # real page in a 27,163,136 B slot row (34% fill) and needs 4 chunks
++        # per 3,584-token alignment segment -- 45% of the CPU pool for the
++        # drafter's own KV. Offloading it costs more reuse depth than the
++        # acceptance it preserves on this box.
++        is_draft_sw = type(spec).__name__ == "SlidingWindowSpec"
++        if participates and divisible and not is_draft_sw:
+             _groups.append(
+                 OffloadingGroupConfig(
+                     tokens_per_block=tokens_per_block,

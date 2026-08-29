@@ -1,0 +1,305 @@
+diff -ru glm5next.pristine/nvidia/attention.py glm5next/nvidia/attention.py
+--- glm5next.pristine/nvidia/attention.py	2026-08-27 23:40:59.471308353 -0400
++++ glm5next/nvidia/attention.py	2026-08-27 23:48:10.219872448 -0400
+@@ -203,6 +203,25 @@
+         return KpoolTailBackend
+ 
+ 
++def _is_mixed_precision_quant(quant_config) -> bool:
++    """True for ModelOpt MIXED_PRECISION checkpoints (per-layer quantized_layers).
++
++    Patch (2026-08-27, local-inference-lab/GLM-5.3-Flash-NVFP4-4p67): that
++    checkpoint quantizes EVERY attention projection (KDA q/k/v/b/f/g/o, MLA
++    q_a/q_b/kv_a/kv_b/o, indexer wq_b/wk/weights_proj) and the shared experts to
++    MXFP8, while this model code hard-codes those as BF16 for the official FP8
++    checkpoint. With a mixed-precision config, each prefix resolves its own
++    algo (unlisted layers stay unquantized), so it is safe to pass the config
++    through; for any other config the original BF16 behaviour is kept.
++    """
++    if quant_config is None:
++        return False
++    try:
++        return quant_config.get_name() == "modelopt_mixed"
++    except Exception:
++        return False
++
++
+ class Indexer(nn.Module):
+     def __init__(
+         self,
+@@ -256,6 +275,11 @@
+         )
+         # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+         # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
++        # NOTE (patch 2026-08-27): this MUST stay BF16 even for MIXED_PRECISION
++        # checkpoints -- forward() reads `wk_weights_proj.weight.data` raw for the
++        # fp32 head-gate, which a packed (Marlin) weight breaks. MXFP8 wk /
++        # weights_proj tensors are dequantized to BF16 on load instead
++        # (model.py: _try_load_fp8_indexer_wk).
+         self.wk_weights_proj = MergedColumnParallelLinear(
+             hidden_size,
+             [self.head_dim, self.n_head],
+diff -ru glm5next.pristine/nvidia/kda.py glm5next/nvidia/kda.py
+--- glm5next.pristine/nvidia/kda.py	2026-08-27 23:40:59.471367670 -0400
++++ glm5next/nvidia/kda.py	2026-08-27 23:40:59.487593707 -0400
+@@ -55,6 +55,25 @@
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+ 
++def _is_mixed_precision_quant(quant_config) -> bool:
++    """True for ModelOpt MIXED_PRECISION checkpoints (per-layer quantized_layers).
++
++    Patch (2026-08-27, local-inference-lab/GLM-5.3-Flash-NVFP4-4p67): that
++    checkpoint quantizes EVERY attention projection (KDA q/k/v/b/f/g/o, MLA
++    q_a/q_b/kv_a/kv_b/o, indexer wq_b/wk/weights_proj) and the shared experts to
++    MXFP8, while this model code hard-codes those as BF16 for the official FP8
++    checkpoint. With a mixed-precision config, each prefix resolves its own
++    algo (unlisted layers stay unquantized), so it is safe to pass the config
++    through; for any other config the original BF16 behaviour is kept.
++    """
++    if quant_config is None:
++        return False
++    try:
++        return quant_config.get_name() == "modelopt_mixed"
++    except Exception:
++        return False
++
++
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+     """Merged projection with multiple replicated output shards.
+ 
+@@ -172,6 +191,10 @@
+         vllm_config.quant_config = None
+         super().__init__(config, vllm_config, prefix)
+         vllm_config.quant_config = saved_quant_config
++        # PATCH: MIXED_PRECISION checkpoints list the KDA projections per layer
++        # (MXFP8 in GLM-5.3-Flash-NVFP4-4p67); let the config decide per prefix.
++        if _is_mixed_precision_quant(saved_quant_config):
++            self.quant_config = saved_quant_config
+ 
+         # Linear-attention head config: read the flattened top-level fields when
+         # present (new schema); fall back to the legacy linear_attn_config dict
+diff -ru glm5next.pristine/nvidia/model.py glm5next/nvidia/model.py
+--- glm5next.pristine/nvidia/model.py	2026-08-27 23:40:59.471527036 -0400
++++ glm5next/nvidia/model.py	2026-08-28 01:53:29.541070103 -0400
+@@ -64,6 +64,8 @@
+     IsHybrid,
+     MixtureOfExperts,
+     SupportsPP,
++    SupportsEagle3,
++    EagleModelMixin,
+ )
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+@@ -326,7 +328,12 @@
+                 kv_lora_rank=config.kv_lora_rank,
+                 max_position_embeddings=config.max_position_embeddings,
+                 cache_config=cache_config,
+-                quant_config=None,  # MLA projections are BF16 in checkpoint
++                # MLA projections are BF16 in the official fp8 checkpoint; PATCH:
++                # a MIXED_PRECISION config carries per-layer entries (MXFP8 in
++                # GLM-5.3-Flash-NVFP4-4p67), so let it decide per prefix.
++                quant_config=quant_config
++                if _is_mixed_precision_quant(quant_config)
++                else None,
+                 prefix=f"{prefix}.self_attn",
+                 topk_indices_buffer=topk_indices_buffer,
+                 skip_rope=getattr(config, "mla_nope", False),
+@@ -575,7 +582,7 @@
+         )
+ 
+ 
+-class Glm5NextModel(nn.Module):
++class Glm5NextModel(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -703,10 +710,27 @@
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+ 
+-        for layer in self._active_layers:
++        # PATCH (2026-08-28): EAGLE-3/DFlash aux hidden states. The drafter reads
++        # the token hidden state after layers `aux_hidden_state_layers` (1-based
++        # "after layer i" semantics, see eagle3_utils). Under mHC the layer
++        # returns the deferred (x, residual, post, comb) form; the real hidden
++        # state is hc_post(...) contracted over the residual streams — the same
++        # reconstruction the last layer performs (and DeepSeek-V4/jj do for DSpark).
++        aux_hidden_states: list[torch.Tensor] = []
++        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
+             hidden_states, residual, post, comb = layer(
+                 positions, hidden_states, residual, post, comb
+             )
++            if (idx + 1) in self.aux_hidden_state_layers:
++                if post is not None:
++                    aux = hc_contract(layer.hc_post(hidden_states, residual, post, comb), layer.n)
++                elif residual is not None:
++                    aux = hidden_states + residual
++                else:
++                    aux = hidden_states
++                if self.is_sequence_parallel:
++                    aux = sp_all_gather(aux)[:full_num_tokens]
++                aux_hidden_states.append(aux)
+ 
+         if not get_pp_group().is_last_rank:
+             # PP is gated off for GLM5Next (no make_empty_intermediate_tensors),
+@@ -722,6 +746,8 @@
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+ 
+         hidden_states = self.norm(hidden_states)
++        if aux_hidden_states:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -887,8 +913,18 @@
+ 
+ 
+ class Glm5NextForCausalLM(
+-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
++    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
+ ):
++    # PATCH: fused-projection map so a MIXED_PRECISION quant config can resolve
++    # the checkpoint's per-shard entries (q_proj, k_proj, ...) for vLLM's fused
++    # modules. Harmless for other configs (they ignore unknown keys).
++    packed_modules_mapping = {
++        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
++        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
++        "wk_weights_proj": ["wk", "weights_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++    }
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.model_config = vllm_config.model_config
+@@ -987,8 +1023,17 @@
+     dummy_inputs=Glm4vDummyInputsBuilder,
+ )
+ class Glm5NextForConditionalGeneration(
+-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+-):
++    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3):
++    # PATCH: fused-projection map so a MIXED_PRECISION quant config can resolve
++    # the checkpoint's per-shard entries (q_proj, k_proj, ...) for vLLM's fused
++    # modules. Harmless for other configs (they ignore unknown keys).
++    packed_modules_mapping = {
++        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
++        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
++        "wk_weights_proj": ["wk", "weights_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++    }
+     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
+     # multimodal wrapper must declare the same interfaces so vLLM treats it as
+     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
+@@ -1076,6 +1121,25 @@
+         return config
+ 
+ 
++def _is_mixed_precision_quant(quant_config) -> bool:
++    """True for ModelOpt MIXED_PRECISION checkpoints (per-layer quantized_layers).
++
++    Patch (2026-08-27, local-inference-lab/GLM-5.3-Flash-NVFP4-4p67): that
++    checkpoint quantizes EVERY attention projection (KDA q/k/v/b/f/g/o, MLA
++    q_a/q_b/kv_a/kv_b/o, indexer wq_b/wk/weights_proj) and the shared experts to
++    MXFP8, while this model code hard-codes those as BF16 for the official FP8
++    checkpoint. With a mixed-precision config, each prefix resolves its own
++    algo (unlisted layers stay unquantized), so it is safe to pass the config
++    through; for any other config the original BF16 behaviour is kept.
++    """
++    if quant_config is None:
++        return False
++    try:
++        return quant_config.get_name() == "modelopt_mixed"
++    except Exception:
++        return False
++
++
+ def get_spec_layer_idx_from_weight_name(
+     config: Glm5NextConfig, weight_name: str
+ ) -> int | None:
+@@ -1091,32 +1155,56 @@
+     return None
+ 
+ 
++def _dequant_mxfp8(weight_fp8: torch.Tensor, scale_e8m0: torch.Tensor) -> torch.Tensor:
++    """Dequantize an MXFP8 weight ([N, K] e4m3 + [N, K/32] e8m0-as-uint8) to BF16."""
++    n, k = weight_fp8.shape
++    group = k // scale_e8m0.shape[1]
++    scale = torch.exp2(scale_e8m0.to(torch.float32) - 127.0)
++    scale = scale.repeat_interleave(group, dim=1)[:, :k]
++    return (weight_fp8.to(torch.float32) * scale).to(torch.bfloat16).contiguous()
++
++
++# Indexer projections fused into the BF16 `wk_weights_proj` (shard 0 = wk,
++# shard 1 = weights_proj). The checkpoint may store either as block-FP8
++# (weight + weight_scale_inv, official fp8 release: wk only) or as MXFP8
++# (weight + uint8 weight_scale, GLM-5.3-Flash-NVFP4-4p67: wk AND weights_proj).
++_INDEXER_FUSED_SHARDS = {".wk.": 0, ".weights_proj.": 1}
++
++
+ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+-    if "indexer.wk." not in name or "wk_weights" in name:
++    if "indexer." not in name or "wk_weights" in name:
++        return False
++    matched = next((s for s in _INDEXER_FUSED_SHARDS if s in name), None)
++    if matched is None:
+         return False
++    shard_id = _INDEXER_FUSED_SHARDS[matched]
+     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+-    is_scale = "weight_scale_inv" in name
++    is_scale = name.endswith(".weight_scale_inv") or name.endswith(".weight_scale")
+     if not is_weight and not is_scale:
+-        return False
+-    layer_prefix = name.rsplit(".wk.", 1)[0]
+-    entry = buf.setdefault(layer_prefix, {})
++        return False  # BF16 tensor: the normal stacked path loads it
++    layer_prefix = name.rsplit(matched, 1)[0]
++    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
++    if f"{layer_prefix}.wk_weights_proj.weight_scale" in params_dict:
++        return False  # model kept the fused layer quantized: stacked path
++    entry = buf.setdefault((layer_prefix, shard_id), {})
+     entry["weight" if is_weight else "scale"] = tensor
+     if "weight" not in entry or "scale" not in entry:
+         return True
+ 
+-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+-    del buf[layer_prefix]
+-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+-    weight_bf16 = scaled_dequantize(
+-        weight_fp8,
+-        scale_inv,
+-        group_shape=GroupShape(block_size, block_size),
+-        out_dtype=torch.bfloat16,
+-    )
+-
+-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
++    weight_fp8, scale = entry["weight"], entry["scale"]
++    del buf[(layer_prefix, shard_id)]
++    if scale.dtype == torch.uint8:
++        weight_bf16 = _dequant_mxfp8(weight_fp8, scale)
++    else:
++        block_size = weight_fp8.shape[1] // scale.shape[1]
++        weight_bf16 = scaled_dequantize(
++            weight_fp8,
++            scale,
++            group_shape=GroupShape(block_size, block_size),
++            out_dtype=torch.bfloat16,
++        )
+     param = params_dict[fused_name]
+-    param.weight_loader(param, weight_bf16, 0)
++    param.weight_loader(param, weight_bf16, shard_id)
+     loaded_params.add(fused_name)
+     return True
+ 
+@@ -1195,6 +1283,10 @@
+     # handle it (it has a weight_scale_inv param).
+     if target_s in params_dict:
+         return False
++    # PATCH: same for MXFP8-quantized targets (`weight_scale`, e8m0 per 32-group):
++    # the stacked/direct loaders take the fp8 weight and its scale as-is.
++    if f"{layer_prefix}.{target_base}.weight_scale" in params_dict:
++        return False
+ 
+     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
+     entry["weight" if is_weight else "scale"] = tensor

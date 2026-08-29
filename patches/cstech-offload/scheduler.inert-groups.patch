@@ -1,0 +1,185 @@
+--- scheduler.pristine.py	2026-08-28 05:22:13.024126192 -0400
++++ scheduler.py	2026-08-28 07:03:27.055158380 -0400
+@@ -104,6 +104,13 @@
+     # of these groups is volatile and lacks a stable hash, so it must
+     # be excluded from store and load scheduling.
+     is_eagle_group: bool = False
++    # PATCH (local, 2026-08-28): True for a group that exists in this tuple
++    # only to keep offload-group index == KV-cache-group index. It is never
++    # hashed, stored, loaded or looked up; it still contributes a zero-sized
++    # entry to GPULoadStoreSpec.group_sizes so the worker's per-group arrays
++    # (built from kv_cache_config.kv_cache_groups) stay aligned. Marked by
++    # build_offloading_config as an OffloadingGroupConfig with layer_names=().
++    is_inert: bool = False
+ 
+ 
+ def get_sliding_window_size_in_chunks(
+@@ -158,6 +165,11 @@
+     """
+     mamba_align_size: int | None = None
+     for idx, tokens_per_block in enumerate(spec.tokens_per_block):
++        if not spec.config.groups[idx].layer_names:
++            # PATCH: inert group -- it carries a placeholder tokens_per_block
++            # and never sees offload traffic, so it must not set (or clash
++            # with) the mamba alignment size.
++            continue
+         kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+         if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode in (
+             "align",
+@@ -189,8 +201,15 @@
+         # hits are always aligned to this boundary, so SWA blocks earlier in
+         # each segment can never serve a load hit. Relevant for hybrid
+         # architectures like DeepSeek V4 (MLA + SWA groups).
++        # PATCH: groups kept in position but never offloaded (layer_names=()).
++        inert_groups = {
++            idx for idx, group in enumerate(spec.config.groups) if not group.layer_names
++        }
++
+         full_attn_tokens_per_chunk: set[int] = set()
+         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
++            if idx in inert_groups:
++                continue
+             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+@@ -242,6 +261,32 @@
+         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+             kv_spec = kv_cache_group.kv_cache_spec
++            if idx in inert_groups:
++                # PATCH: placeholder keeping group_idx == KV cache group index.
++                # tokens_per_chunk / hashes_per_chunk are well-formed (never 0)
++                # so the shared per-group bookkeeping loops stay safe, but every
++                # store / load / lookup path skips it on is_inert.
++                kv_group_configs_list.append(
++                    GroupOffloadConfig(
++                        group_idx=idx,
++                        tokens_per_block=tokens_per_block,
++                        tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
++                        hashes_per_chunk=max(
++                            1,
++                            (tokens_per_block * spec.blocks_per_chunk)
++                            // spec.tokens_per_hash,
++                        ),
++                        sliding_window_size_in_chunks=None,
++                        alignment_chunk_count=None,
++                        kv_event_group_spec=get_offloading_event_group_spec(
++                            kv_cache_group
++                        ),
++                        is_eagle_group=False,
++                        requires_cow_source=False,
++                        is_inert=True,
++                    )
++                )
++                continue
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+             )
+@@ -267,25 +312,33 @@
+                 )
+             )
+         kv_group_configs = tuple(kv_group_configs_list)
+-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
++        # PATCH: shape decisions look at the groups that actually offload.
++        active_group_configs = tuple(
++            config for config in kv_group_configs if not config.is_inert
++        )
++        group_block_sizes = {config.tokens_per_block for config in active_group_configs}
+         has_partial_recurrent_group = any(
+             config.requires_cow_source
+             and config.tokens_per_block > spec.tokens_per_hash
+-            for config in kv_group_configs
++            for config in active_group_configs
+         )
+         # Partial tails currently require one physical block per offload chunk
+         # and uniform, non-windowed groups so one boundary identifies every
+         # group's source. EAGLE and DCP need additional hand-off semantics.
+         supports_partial_tail = (
+-            spec.blocks_per_chunk == 1
++            # PATCH: the partial-tail hand-off indexes every group's block
++            # table by one shared boundary; an inert group has no offloaded
++            # blocks to hand off, so disable the optimization outright.
++            not inert_groups
++            and spec.blocks_per_chunk == 1
+             and len(group_block_sizes) == 1
+             and has_partial_recurrent_group
+             and all(
+                 config.sliding_window_size_in_chunks is None
+                 or config.requires_cow_source
+-                for config in kv_group_configs
++                for config in active_group_configs
+             )
+-            and not any(config.is_eagle_group for config in kv_group_configs)
++            and not any(config.is_eagle_group for config in active_group_configs)
+             and vllm_config.parallel_config.decode_context_parallel_size == 1
+         )
+ 
+@@ -357,6 +410,9 @@
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
++            if group_config.is_inert:
++                # PATCH: never hashed, so it never gets offload keys.
++                continue
+             for req_block_hash in islice(
+                 self.req.block_hashes,
+                 group_config.hashes_per_chunk * len(group_state.offload_keys)
+@@ -504,6 +560,9 @@
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+         for group_config in self.config.kv_group_configs:
++            if group_config.is_inert:
++                # PATCH: never looked up.
++                continue
+             if group_config.sliding_window_size_in_chunks is None:
+                 full_attention_groups.append(group_config.group_idx)
+             else:
+@@ -667,6 +726,9 @@
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, req_status.group_states
+         ):
++            if group_config.is_inert:
++                # PATCH: no keys to touch.
++                continue
+             if group_config.sliding_window_size_in_chunks is None:
+                 self.manager.touch(group_state.offload_keys, req_status.req_context)
+             else:
+@@ -1018,6 +1080,16 @@
+                 block.block_id for block in group_blocks if block.block_id != 0
+             )
+ 
++            if group_config.is_inert:
++                # PATCH: nothing offloaded for this group -- contribute an
++                # empty slice so the worker's per-group arrays stay aligned.
++                # An offload hit therefore leaves this group's freshly
++                # allocated GPU blocks untouched, exactly as a GPU prefix
++                # cache hit does (it opts out of prefix caching).
++                group_sizes.append(0)
++                block_indices.append(0)
++                continue
++
+             tokens_per_block = group_config.tokens_per_block
+             tokens_per_chunk = group_config.tokens_per_chunk
+             offload_keys = group_state.offload_keys
+@@ -1278,6 +1350,9 @@
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.is_inert:
++                    # PATCH: never stored.
++                    continue
+                 num_chunks = req_status.storable_chunks(
+                     group_config, group_state, num_offloadable_tokens
+                 )
+@@ -1349,6 +1424,11 @@
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.is_inert:
++                    # PATCH: zero-sized entry keeps the worker aligned.
++                    group_sizes.append(0)
++                    block_indices.append(0)
++                    continue
+                 is_sliding_window = (
+                     group_config.sliding_window_size_in_chunks is not None
+                 )

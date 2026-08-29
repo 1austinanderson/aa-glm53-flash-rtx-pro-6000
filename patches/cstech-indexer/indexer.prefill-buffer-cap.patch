@@ -1,0 +1,68 @@
+--- indexer.pristine.py	2026-08-28 04:01:48.665659734 -0400
++++ indexer.py	2026-08-28 04:02:14.731359591 -0400
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from dataclasses import dataclass
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -116,6 +118,21 @@
+         # on the query dimension.
+         if end == start:
+             chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
++            # cstech 2026-08-28: sub-chunking bounds the LOGITS (M) dimension
++            # only -- chunk_n is still the request's whole compressed context,
++            # and the caller slices the K-gather workspace as
++            # `k_quant_full[:chunk.total_seq_lens]`. A torch slice past the end
++            # silently returns a SHORT tensor rather than raising, so a
++            # workspace smaller than this request would corrupt the indexer
++            # scores instead of failing. Fail loudly instead.
++            if chunk_n > workspace_size:
++                raise ValueError(
++                    "sparse indexer K-gather workspace too small: request needs "
++                    f"{chunk_n} compressed entries but the workspace holds "
++                    f"{workspace_size}. Raise "
++                    "VLLM_INDEXER_PREFILL_BUFFER_ENTRIES_PER_TOKEN (upstream "
++                    "default 40) or lower max_model_len."
++                )
+             end += 1
+ 
+         req_slice = slice(start + request_offset, end + request_offset)
+@@ -643,7 +660,33 @@
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    #
++    # cstech 2026-08-28: this value is a *chunking budget*, not a correctness
++    # requirement. It caps `total_seq_lens` (summed COMPRESSED context of the
++    # prefill requests in one indexer chunk, see split_indexer_prefill_chunks)
++    # and is also what sizes the persistent K-gather workspace
++    # (_gather_workspace_shapes -> WorkspaceManager, 132 B/entry). The `* 40`
++    # constant is a datacenter-part performance choice; on a 2x RTX PRO 6000
++    # box it reserves 825 MiB at 163840 and 1321 MiB at 262144 per GPU, which
++    # comes straight out of the KV pool.
++    #
++    # The real floor is set by the one place the splitter is allowed to
++    # overflow: a single request that does not fit is taken alone
++    # (`if end == start`). So the workspace must hold the largest single
++    # request's compressed context, cdiv(max_model_len, compress_ratio); the
++    # multi-request case merely chunks more. Budgeting
++    # `max_num_seqs * max_model_len` is >= that floor for any compress_ratio
++    # >= 1 (GLM-5-Next uses index_kpool = 4, so it carries ~8x margin) while
++    # only chunking more when many long prefills coincide -- which
++    # max_num_seqs bounds anyway.
++    #
++    # VLLM_INDEXER_PREFILL_BUFFER_ENTRIES_PER_TOKEN overrides the multiplier;
++    # set it to 40 to restore exact upstream behaviour.
++    override = os.environ.get("VLLM_INDEXER_PREFILL_BUFFER_ENTRIES_PER_TOKEN")
++    if override:
++        return max_model_len * int(override)
++    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
++    return max(1, max_num_seqs) * max_model_len
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:

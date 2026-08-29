@@ -1,0 +1,98 @@
+--- /mnt/raid/glm53-flash/patches/cstech-offload/config.pristine.py	2026-08-28 05:11:36.425073641 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-offload/config.py	2026-08-28 05:32:57.759556564 -0400
+@@ -40,29 +40,75 @@
+     engine_id = kv_transfer_config.engine_id
+ 
+     parallel_config = vllm_config.parallel_config
+-    groups = tuple(
+-        OffloadingGroupConfig(
+-            tokens_per_block=(
+-                group.kv_cache_spec.block_size
+-                * (
+-                    parallel_config.decode_context_parallel_size
+-                    if isinstance(group.kv_cache_spec, AttentionSpec)
+-                    else 1
++    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
++
++    # PATCH (local, 2026-08-28): keep EVERY KV cache group in the offload
++    # config, IN POSITION, and mark the ones that cannot be hashed at the
++    # scheduler's granularity as *inert* (layer_names=()).
++    #
++    # Why not drop them: both the offloading scheduler and the offloading
++    # worker map offload groups to KV cache groups POSITIONALLY
++    # (`kv_cache_config.kv_cache_groups[idx]` in scheduler.py, and
++    # `GPULoadStoreSpec.group_sizes` which the worker asserts has one entry per
++    # `kv_cache_config.kv_cache_groups`). Dropping a group shifts every later
++    # index and mis-pairs mamba specs with attention block sizes.
++    #
++    # Which groups are inert on GLM-5-Next: the kpool tail group
++    # (KpoolTailSpec, 4-token circular scratch blocks,
++    # participates_in_prefix_caching=False -- the GPU prefix cache already
++    # skips it, so a fresh tail after an offload hit is exactly what a GPU
++    # prefix-cache hit already produces), plus, defensively, any group whose
++    # tokens_per_block is not a multiple of tokens_per_hash. Upstream asserts
++    # and kills the engine instead.
++    #
++    # An inert group is given tokens_per_block=tokens_per_hash so every
++    # divisibility / hashes-per-chunk computation downstream stays well-formed
++    # (never 0), and layer_names=() so the scheduler overlay can recognise it
++    # (see GroupOffloadConfig.is_inert in
++    # vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py).
++    from vllm.logger import init_logger
++
++    _log = init_logger(__name__)
++    _groups: list[OffloadingGroupConfig] = []
++    for group in kv_cache_config.kv_cache_groups:
++        spec = group.kv_cache_spec
++        tokens_per_block = spec.block_size * (
++            parallel_config.decode_context_parallel_size
++            if isinstance(spec, AttentionSpec)
++            else 1
++        )
++        participates = getattr(spec, "participates_in_prefix_caching", True)
++        divisible = tokens_per_block % tokens_per_hash == 0
++        if participates and divisible:
++            _groups.append(
++                OffloadingGroupConfig(
++                    tokens_per_block=tokens_per_block,
++                    layer_names=tuple(group.layer_names),
+                 )
+-            ),
+-            layer_names=tuple(group.layer_names),
++            )
++            continue
++        _log.warning(
++            "KV offload: group %d (%s, %d layers, tokens_per_block=%d, "
++            "tokens_per_hash=%d, participates_in_prefix_caching=%s) is INERT "
++            "-- kept in position, never stored or loaded. First layers: %s",
++            len(_groups),
++            type(spec).__name__,
++            len(group.layer_names),
++            tokens_per_block,
++            tokens_per_hash,
++            participates,
++            list(group.layer_names[:2]),
+         )
+-        for group in kv_cache_config.kv_cache_groups
+-    )
+-
+-    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+-    for group in groups:
+-        assert group.tokens_per_block % tokens_per_hash == 0, (
+-            f"tokens_per_block={group.tokens_per_block} not divisible by "
+-            f"tokens_per_hash={tokens_per_hash}. "
+-            f"Hybrid models (e.g. Mamba+Attention) need "
+-            f"--enable-prefix-caching to align block sizes."
++        _groups.append(
++            OffloadingGroupConfig(
++                tokens_per_block=tokens_per_hash,
++                layer_names=(),
++            )
+         )
++    groups = tuple(_groups)
++    assert any(group.layer_names for group in groups), (
++        "KV offload: every KV cache group is inert; nothing can be offloaded."
++    )
+ 
+     blocks_per_chunk = 1
+     blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
