@@ -26,6 +26,16 @@ sparse indexer (MXFP8)        ▏                                     0.09  0.1%
 
 93% of the card is MoE experts; the vision tower is a rounding error.
 
+## Requirements (what this was built and measured on)
+- 2× NVIDIA RTX PRO 6000 Blackwell Workstation (96 GB, SM120) on PCIe Gen5, no NVLink; driver 595.84; the two cards must be
+  `CUDA_VISIBLE_DEVICES=0,1` in `PCI_BUS_ID` order (any third card is left alone).
+- Docker 29 + NVIDIA Container Toolkit 1.19 (`--gpus all`). The image is CUDA 13.0 (`cu130`), pulled from Docker Hub (8.7 GB compressed).
+- Host RAM: the defaults use a 32 GB host-RAM KV tier inside a 48 GB `/dev/shm` (`--shm-size 48gb`); with `OFFLOAD_GIB=0` the
+  `--shm-size` can drop to 32gb. Built on a 177 GB host.
+- Disk: ~175 GB checkpoint + ~2 GB drafter (+1.5 GB for the FP8 build) + ~30 GB image unpacked + the compile caches.
+- Python with `torch` and `safetensors` on the host only for `tools/quant_drafter_fp8.py` (one-off, CPU is fine).
+- Boot ≈ 4.7 min with InstantTensor (first boot longer: FlashInfer JIT + CUDA-graph capture populate `CACHE_DIR`).
+
 ## Ingredients
 - **Checkpoint:** `local-inference-lab/GLM-5.3-Flash-NVFP4-4p67` (174.75 GiB). ModelOpt MIXED_PRECISION: routed experts
   W4A16-NVFP4 g16, **attention + shared experts + sparse indexer MXFP8 g32**, dense MLP / embeddings / lm_head BF16.
