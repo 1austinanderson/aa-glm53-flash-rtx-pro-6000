@@ -9,20 +9,21 @@ bench/stress scripts; `results/` the measured rows.
 
 ## Where the 96 GB goes (per GPU, TP2)
 The weights alone leave ~8 GiB per card for everything else, which is why every later step is about buying back a few
-hundred MiB. Measured pieces from the boot logs; "activation / scratch" is the remainder, and a full-window request drives
-free memory down to 8 MiB.
+hundred MiB. 93.99 GiB is usable per card (95.6 on the card; CUDA context takes the rest). Measured pieces from the boot logs;
+"activation / scratch" is the remainder, and a full-window request drives free memory down to 8 MiB. The bf16 drafter
+was 1.47 GiB before the FP8 rebuild; the indexer workspace was 1.98 GiB before the cap in step 6.
 
 ```
 per GPU                                                            GiB
 weights (TP2 shard)           ██████████████████████████████████  85.96
 KV cache (fp8, explicit)      █▌                                   3.80
-activation / scratch          ▌                                    2.32  (what's left; a 380k request uses all of it)
-DFlash-2 drafter (FP8)        ▎                                    ~1.0  (bf16 drafter: 1.47)
+activation / scratch          ▌                                    2.32
+DFlash-2 drafter (FP8)        ▎                                    ~1.0
 non-torch (NCCL, FlashInfer)  ▎                                    0.70
 CUDA graphs                   ▏                                    0.15
-indexer prefill workspace     ▏                                    0.06  (1.98 before the cap)
+indexer prefill workspace     ▏                                    0.06
                                                                  ─────
-                                                                 93.99  usable (95.6 on the card; CUDA context takes the rest)
+                                                                 93.99
 ```
 
 What the checkpoint is made of (`safetensors` headers, 258,757 tensors):
