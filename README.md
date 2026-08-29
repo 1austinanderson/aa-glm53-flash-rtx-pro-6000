@@ -8,22 +8,17 @@ failure that motivated each step. All patches are small bind-mounted overlays on
 bench/stress scripts; `results/` the measured rows.
 
 ## Where the 96 GB goes (per GPU, TP2)
-The weights alone leave ~8 GiB per card for everything else, which is why every later step is about buying back a few
-hundred MiB. 93.99 GiB is usable per card (95.6 on the card; CUDA context takes the rest). Measured pieces from the boot logs;
-"activation / scratch" is the remainder, and a full-window request drives free memory down to 8 MiB. The bf16 drafter
-was 1.47 GiB before the FP8 rebuild; the indexer workspace was 1.98 GiB before the cap in step 6.
+93.99 GiB is usable per card. The weights leave ~8 GiB for everything else, which is why every later step is about buying
+back a few hundred MiB. Only what the boot logs measured is listed; the remainder is activation scratch, which was not
+profiled separately on the explicit-KV boots. The FP8 drafter is smaller than the bf16 figure shown (not profiled separately).
 
 ```
-per GPU                                                            GiB
+per GPU, measured                                                  GiB
 weights (TP2 shard)           ██████████████████████████████████  85.96
 KV cache (fp8, explicit)      █▌                                   3.80
-activation / scratch          ▌                                    2.32
-DFlash-2 drafter (FP8)        ▎                                    ~1.0
+DFlash-2 drafter (bf16)       ▌                                    1.47
 non-torch (NCCL, FlashInfer)  ▎                                    0.70
 CUDA graphs                   ▏                                    0.15
-indexer prefill workspace     ▏                                    0.06
-                                                                 ─────
-                                                                 93.99
 ```
 
 What the checkpoint is made of (`safetensors` headers, 258,757 tensors):
@@ -39,11 +34,10 @@ dense MLP (BF16)              ▏                                     0.94  0.5%
 norms / gates / mHC           ▏                                     0.10  0.1%
 sparse indexer (MXFP8)        ▏                                     0.09  0.1%
                                                                  ─────
-                                                                174.73
+                                                               174.73
 ```
 
-93% of the card is MoE experts and the vision tower is a rounding error. The two things you can trade against each other are
-the KV claim and the scratch reserve; DFlash costs ~1 GiB of weights plus ~518 MiB of KV per concurrent request
+93% of the card is MoE experts; the vision tower is a rounding error. DFlash also pins ~518 MiB of KV per concurrent request
 (4 KDA groups × (2+K) block ids at K=3) — that fixed cost, not KV bytes, is the concurrency limiter.
 
 ## Ingredients
