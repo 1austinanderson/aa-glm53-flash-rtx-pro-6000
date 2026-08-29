@@ -60,6 +60,7 @@ MODELS_DIR=/mnt/raid/models ./serve.sh
 # no-drafter variant from the table below:
 K=0 OFFLOAD_GIB=0 CTX=262144 SEQS=4 UTIL=0.985 KV_MEM_BYTES=0 ./serve.sh
 ```
+Verified 2026-08-29: a clean boot from this repo with the defaults reproduces the 430,528-token pool and passes `lavd-test` 10/10 at C=6.
 `serve.sh` mounts only the overlays a given configuration needs (K=0 skips the DFlash/attention/kv-layout mounts;
 OFFLOAD_GIB=0 skips the offload connector and leaves `expandable_segments` on).
 
