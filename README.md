@@ -7,21 +7,8 @@ failure that motivated each step. All patches are small bind-mounted overlays on
 **This repo is the recipe:** `serve.sh` + `patches/` reproduce the serving stack; `tools/` holds the drafter quantizer and the
 bench/stress scripts; `results/` the measured rows.
 
-## Where the 96 GB goes (per GPU, TP2)
-93.99 GiB is usable per card. The weights leave ~8 GiB for everything else, which is why every later step is about buying
-back a few hundred MiB. Only what the boot logs measured is listed; the remainder is activation scratch, which was not
-profiled separately on the explicit-KV boots. The FP8 drafter is smaller than the bf16 figure shown (not profiled separately).
-
-```
-per GPU, measured                                                  GiB
-weights (TP2 shard)           ██████████████████████████████████  85.96
-KV cache (fp8, explicit)      █▌                                   3.80
-DFlash-2 drafter (bf16)       ▌                                    1.47
-non-torch (NCCL, FlashInfer)  ▎                                    0.70
-CUDA graphs                   ▏                                    0.15
-```
-
-What the checkpoint is made of (`safetensors` headers, 258,757 tensors):
+## What the checkpoint is made of
+From the `safetensors` headers (258,757 tensors), on one card after the TP2 split it is ~86 GiB of weights:
 
 ```
 checkpoint (both GPUs)                                              GiB
@@ -37,8 +24,7 @@ sparse indexer (MXFP8)        ▏                                     0.09  0.1%
                                                                174.73
 ```
 
-93% of the card is MoE experts; the vision tower is a rounding error. DFlash also pins ~518 MiB of KV per concurrent request
-(4 KDA groups × (2+K) block ids at K=3) — that fixed cost, not KV bytes, is the concurrency limiter.
+93% of the card is MoE experts; the vision tower is a rounding error.
 
 ## Ingredients
 - **Checkpoint:** `local-inference-lab/GLM-5.3-Flash-NVFP4-4p67` (174.75 GiB). ModelOpt MIXED_PRECISION: routed experts
