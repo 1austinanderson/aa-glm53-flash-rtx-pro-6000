@@ -1,0 +1,66 @@
+--- /mnt/raid/glm53-flash/patches/cstech-coord/kv_cache_coordinator.pristine.py	2026-08-30 04:29:40.033290347 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-coord/kv_cache_coordinator.py	2026-08-30 05:29:36.602991457 -0400
+@@ -29,6 +29,16 @@
+ 
+ logger = init_logger(__name__)
+ 
++# PATCH (local, 2026-08-30): EAGLE/DFlash hit back-off in hash units. Upstream
++# drops ONE unit (896 tokens here) so the drafter gets hidden states for the
++# tail; DFlash-2's drafter attends over a 2,048-token sliding window whose KV
++# is NOT restored on a hit (draft group inert for offload / superseded local
++# tail), so <2,048 recomputed tokens leave it drafting from stale KV -- measured
++# 0/367 drafts accepted after a hit. 3 units (2,688-3,583 recomputed) keeps it
++# alive. Default 1 = upstream byte-for-byte.
++import os as _os
++_EAGLE_DROP_UNITS = max(1, int(_os.environ.get("VLLM_EAGLE_DROP_UNITS", "1")))
++
+ 
+ def _validate_prefix_cache_retention_interval(
+     retention_interval: int | None,
+@@ -600,10 +610,20 @@
+         )
+         self.enable_partial_hash_hits = dcp_world_size == 1 and has_partial_mamba_group
+         if self.enable_partial_hash_hits:
++            # PATCH (local, 2026-08-30): only managers whose group takes part
++            # in prefix caching can constrain the hit granularity. GLM5Next's
++            # kpool tail (KpoolTailSpec, block_size=kpool=4, never hashed,
++            # never looked up -- its finder returns 0 unconditionally) would
++            # otherwise disable fine-grained hits for the whole model, pinning
++            # every prefix hit to the scheduler block (the LCM over groups:
++            # 3,584 tokens by default, 14,336 with --mamba-block-size 14336).
+             unsupported_partial_hit_managers = {
+                 type(manager).__name__
+-                for manager in self.single_type_managers
+-                if not manager.supports_fine_grained_hash_lookup
++                for manager, group in zip(
++                    self.single_type_managers, kv_cache_config.kv_cache_groups
++                )
++                if group.kv_cache_spec.participates_in_prefix_caching
++                and not manager.supports_fine_grained_hash_lookup
+                 and manager.block_size != hash_block_size
+             }
+             if unsupported_partial_hit_managers:
+@@ -613,6 +633,14 @@
+                     "cache managers require block-aligned lookups: %s.",
+                     ", ".join(sorted(unsupported_partial_hit_managers)),
+                 )
++        logger.info(
++            "Prefix-cache hit granularity: %d tokens (partial hash hits %s; "
++            "scheduler block %d, hash block %d).",
++            self.hash_block_size if self.enable_partial_hash_hits else self.scheduler_block_size,
++            "ENABLED" if self.enable_partial_hash_hits else "disabled",
++            self.scheduler_block_size,
++            self.hash_block_size,
++        )
+         self.verify_and_split_kv_cache_groups()
+ 
+     @property
+@@ -788,7 +816,7 @@
+                 # layers), so the hit would grow past the candidate.
+                 if drop_eagle_block and not isinstance(spec, MambaSpec):
+                     eagle_margin = (
+-                        self.hash_block_size
++                        self.hash_block_size * _EAGLE_DROP_UNITS
+                         if self.enable_partial_hash_hits
+                         and manager_cls.supports_fine_grained_hash_lookup
+                         and group_block_size > self.hash_block_size

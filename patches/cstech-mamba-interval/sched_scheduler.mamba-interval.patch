@@ -1,0 +1,35 @@
+--- sched_scheduler.pristine.py	2026-08-25 22:41:50.000000000 -0400
++++ sched_scheduler.py	2026-08-28 06:39:25.069402812 -0400
+@@ -373,7 +373,32 @@
+         if start >= prefill_end:
+             return num_new_tokens
+ 
++        # PATCH (local, 2026-08-28): the boundaries this split must respect are
++        # the MAMBA state-checkpoint boundaries -- the invariant documented
++        # below ("slot p holds the state after exactly (p + 1) * block_size
++        # tokens") is about the mamba block table, and the runner writes the
++        # state at a chunk end into slot `cdiv(computed_after,
++        # mamba_block_size) - 1`. Upstream reads `cache_config.block_size`,
++        # correct only while the platform pins `mamba_block_size ==
++        # block_size` in align mode. Once the state is checkpointed every N
++        # attention blocks, using the attention block size here (a) stops
++        # every chunk N times more often than needed and (b) lets a chunk
++        # larger than one attention block skip a mamba boundary entirely, so a
++        # block would be cached holding the state of an earlier position.
++        # Gated on the explicit --mamba-block-size opt-in: without it this
++        # is upstream's value, byte for byte. (Note `cache_config.block_size`
++        # is rewritten to min(participating group block sizes) = 896 in the
++        # engine-core process before the Scheduler is built, so upstream
++        # already splits finer than the mamba stride -- conservative, and
++        # left alone by default.)
+         block_size = self.cache_config.block_size
++        _user_mamba_block_size = self.cache_config.mamba_block_size
++        if (
++            self.cache_config.user_specified_mamba_block_size
++            and _user_mamba_block_size
++            and _user_mamba_block_size > block_size
++        ):
++            block_size = _user_mamba_block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.

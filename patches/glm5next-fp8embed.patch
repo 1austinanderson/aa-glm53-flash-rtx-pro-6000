@@ -1,0 +1,25 @@
+diff -ru glm5next/nvidia/model.py glm5next-fp8embed/nvidia/model.py
+--- glm5next/nvidia/model.py	2026-08-28 01:53:29.541070103 -0400
++++ glm5next-fp8embed/nvidia/model.py	2026-08-30 07:47:38.119101988 -0400
+@@ -637,9 +637,21 @@
+             topk_indices_buffer = None
+ 
+         if get_pp_group().is_first_rank:
++            # PATCH (local, 2026-08-30): let a MIXED_PRECISION checkpoint decide
++            # the input embedding's storage format, the same way the KDA/MLA
++            # projections already do above.  Only the -embfp8 checkpoint
++            # declares model.language_model.embed_tokens (quant_algo
++            # FP8_EMBED_ROW), so with any other checkpoint -- or the stock
++            # modelopt.py, which returns None for a VocabParallelEmbedding --
++            # this resolves to UnquantizedEmbeddingMethod and the table stays
++            # BF16, exactly as before.  Saves ~0.295 GiB/GPU at TP2 when it
++            # does fire.  Needs the patches/fp8-embed/modelopt.py overlay.
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
++                quant_config=vllm_config.quant_config
++                if _is_mixed_precision_quant(vllm_config.quant_config)
++                else None,
+                 prefix=f"{prefix}.embed_tokens",
+             )
+         else:

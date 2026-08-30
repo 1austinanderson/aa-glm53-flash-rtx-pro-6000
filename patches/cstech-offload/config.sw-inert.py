@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Translate vLLM KV cache metadata for native offloading backends."""
+
+from typing import TYPE_CHECKING
+
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    MLAAttentionSpec,
+)
+from vllm.v1.kv_offload.config import (
+    OffloadingCacheConfig,
+    OffloadingConfig,
+    OffloadingGroupConfig,
+    OffloadingModelConfig,
+    OffloadingParallelConfig,
+)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+
+def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
+    """Return whether a KV cache tensor uses a packed block stride."""
+    return bool(kv_cache_tensor.block_stride)
+
+
+def build_offloading_config(
+    vllm_config: "VllmConfig",
+    kv_cache_config: "KVCacheConfig",
+) -> OffloadingConfig:
+    """Translate vLLM configuration into the native offloading boundary."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    extra_config = kv_transfer_config.kv_connector_extra_config
+    assert kv_transfer_config.engine_id is not None
+    engine_id = kv_transfer_config.engine_id
+
+    parallel_config = vllm_config.parallel_config
+    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+    # PATCH (local, 2026-08-28): keep EVERY KV cache group in the offload
+    # config, IN POSITION, and mark the ones that cannot be hashed at the
+    # scheduler's granularity as *inert* (layer_names=()).
+    #
+    # Why not drop them: both the offloading scheduler and the offloading
+    # worker map offload groups to KV cache groups POSITIONALLY
+    # (`kv_cache_config.kv_cache_groups[idx]` in scheduler.py, and
+    # `GPULoadStoreSpec.group_sizes` which the worker asserts has one entry per
+    # `kv_cache_config.kv_cache_groups`). Dropping a group shifts every later
+    # index and mis-pairs mamba specs with attention block sizes.
+    #
+    # Which groups are inert on GLM-5-Next: the kpool tail group
+    # (KpoolTailSpec, 4-token circular scratch blocks,
+    # participates_in_prefix_caching=False -- the GPU prefix cache already
+    # skips it, so a fresh tail after an offload hit is exactly what a GPU
+    # prefix-cache hit already produces), plus, defensively, any group whose
+    # tokens_per_block is not a multiple of tokens_per_hash. Upstream asserts
+    # and kills the engine instead.
+    #
+    # An inert group is given tokens_per_block=tokens_per_hash so every
+    # divisibility / hashes-per-chunk computation downstream stays well-formed
+    # (never 0), and layer_names=() so the scheduler overlay can recognise it
+    # (see GroupOffloadConfig.is_inert in
+    # vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py).
+    from vllm.logger import init_logger
+
+    _log = init_logger(__name__)
+    _groups: list[OffloadingGroupConfig] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        tokens_per_block = spec.block_size * (
+            parallel_config.decode_context_parallel_size
+            if isinstance(spec, AttentionSpec)
+            else 1
+        )
+        participates = getattr(spec, "participates_in_prefix_caching", True)
+        divisible = tokens_per_block % tokens_per_hash == 0
+        # PATCH (local, 2026-08-30, from config.sw-inert-CANDIDATE.patch): the
+        # DFlash-2 drafter's sliding-window group is 5 layers x ~64 KiB of real
+        # page per 896-token block riding in a 54 MB CPU chunk (34% fill, 4x
+        # more chunks than the 3,584-token MLA group) -- 3.3 GiB of the 7.4 GiB
+        # a 60k prompt costs in host RAM. Keep it in position but inert: after
+        # a RAM hit the drafter re-fills its 2,048-token window from the
+        # recomputed tail (<= 14,336 tokens with --mamba-block-size 14336), so
+        # only hits whose recompute region is shorter than the window see a
+        # short stretch of weak drafts. Target output is unaffected.
+        is_draft_sw = type(spec).__name__ == "SlidingWindowSpec"
+        if participates and divisible and not is_draft_sw:
+            _groups.append(
+                OffloadingGroupConfig(
+                    tokens_per_block=tokens_per_block,
+                    layer_names=tuple(group.layer_names),
+                )
+            )
+            continue
+        _log.warning(
+            "KV offload: group %d (%s, %d layers, tokens_per_block=%d, "
+            "tokens_per_hash=%d, participates_in_prefix_caching=%s) is INERT "
+            "-- kept in position, never stored or loaded. First layers: %s",
+            len(_groups),
+            type(spec).__name__,
+            len(group.layer_names),
+            tokens_per_block,
+            tokens_per_hash,
+            participates,
+            list(group.layer_names[:2]),
+        )
+        _groups.append(
+            OffloadingGroupConfig(
+                tokens_per_block=tokens_per_hash,
+                layer_names=(),
+            )
+        )
+    groups = tuple(_groups)
+    assert any(group.layer_names for group in groups), (
+        "KV offload: every KV cache group is inert; nothing can be offloaded."
+    )
+
+    blocks_per_chunk = 1
+    blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
+    tokens_per_chunk = extra_config.get("block_size")
+
+    if blocks_per_chunk_config is not None and tokens_per_chunk is not None:
+        raise ValueError(
+            "Specify only one of 'block_size' or 'blocks_per_chunk' "
+            "in kv_connector_extra_config."
+        )
+
+    if blocks_per_chunk_config is not None:
+        blocks_per_chunk = int(blocks_per_chunk_config)
+
+        if blocks_per_chunk <= 0:
+            raise ValueError("'blocks_per_chunk' must be greater than 0.")
+
+    elif tokens_per_chunk is not None:
+        tokens_per_chunk_int = int(tokens_per_chunk)
+
+        unique_tokens_per_block = {group.tokens_per_block for group in groups}
+
+        assert len(unique_tokens_per_block) == 1, (
+            "If 'block_size' is specified in kv_connector_extra_config, "
+            "there must be at least one KV cache group, "
+            "and all groups must have the same block size."
+        )
+
+        tokens_per_block = unique_tokens_per_block.pop()
+        assert tokens_per_chunk_int % tokens_per_block == 0
+        blocks_per_chunk = tokens_per_chunk_int // tokens_per_block
+
+    worker_kv_bytes_per_block = 0
+    if kv_cache_config.num_blocks > 0:
+        packed_tensors = tuple(
+            is_kv_cache_tensor_packed(tensor)
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
+        is_packed = any(packed_tensors)
+        assert not is_packed or all(packed_tensors)
+        total_gpu_kv_bytes = (
+            kv_cache_config.kv_cache_tensors[0].size
+            if is_packed
+            else sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+        )
+        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+
+    single_group_spec = (
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if len(kv_cache_config.kv_cache_groups) == 1
+        else None
+    )
+    replicated_layout = (
+        vllm_config.model_config.use_mla
+        # Exact type: fail closed on wrappers and sliding-window variants.
+        and type(single_group_spec) is MLAAttentionSpec
+        # Page accounting: one MLA page per layer, no packed/mixed rows.
+        and worker_kv_bytes_per_block > 0
+        and worker_kv_bytes_per_block
+        == single_group_spec.page_size_bytes
+        * len(kv_cache_config.kv_cache_groups[0].layer_names)
+        # Safe MVP boundary: TP-only, no other parallel axes.
+        and parallel_config.tensor_parallel_size > 1
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.world_size == parallel_config.tensor_parallel_size
+        # Shared /dev/shm mmap layout is single-node mp only.
+        and parallel_config.distributed_executor_backend == "mp"
+        and parallel_config.nnodes_within_dp == 1
+    )
+
+    canonical_layout = bool(extra_config.get("canonical_layout", False))
+
+    # Only a single non-MLA full-attention group with genuinely head-sharded
+    # pages is parallelism-invariant: replicated latent or GQA heads,
+    # per-token-head scales, CP token sharding, and the V2 model runner's
+    # layout are all excluded.
+    is_parallelism_agnostic = (
+        not vllm_config.use_v2_model_runner
+        and single_group_spec is not None
+        and isinstance(single_group_spec, FullAttentionSpec)
+        and not isinstance(single_group_spec, MLAAttentionSpec)
+        and single_group_spec.num_kv_heads * parallel_config.tensor_parallel_size
+        == vllm_config.model_config.get_total_num_kv_heads()
+        and not single_group_spec.kv_quant_mode.is_per_token_head
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+    )
+    # Canonical pages are topology-free by construction, so the canonical
+    # layout widens the gate to every config whose mappings derive portable:
+    # exactly-sharded or replicated GQA heads (writer rotation) and the
+    # TP-replicated MLA latent (one canonical copy for all replicas). The
+    # model-runner version is irrelevant here — certification happens per
+    # layer against live tensor strides at registration, and create_worker
+    # fails closed against this flag if any layer cannot be certified.
+    if canonical_layout and not is_parallelism_agnostic:
+        tp_size = parallel_config.tensor_parallel_size
+        if isinstance(single_group_spec, FullAttentionSpec):
+            if type(single_group_spec) is MLAAttentionSpec:
+                spec_certifiable = (
+                    single_group_spec.compress_ratio == 1
+                    and single_group_spec.real_page_size_bytes
+                    % single_group_spec.block_size
+                    == 0
+                )
+            else:
+                total_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+                spec_certifiable = (
+                    total_kv_heads % tp_size == 0 or tp_size % total_kv_heads == 0
+                )
+            is_parallelism_agnostic = (
+                spec_certifiable
+                and not single_group_spec.kv_quant_mode.is_per_token_head
+                and parallel_config.decode_context_parallel_size == 1
+                and parallel_config.prefill_context_parallel_size == 1
+                and parallel_config.world_size == tp_size
+            )
+
+    kv_events_config = vllm_config.kv_events_config
+    cache_dtype = (
+        vllm_config.model_config.dtype
+        if vllm_config.cache_config.cache_dtype == "auto"
+        else vllm_config.cache_config.cache_dtype
+    )
+
+    return OffloadingConfig(
+        groups=groups,
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
+        enable_kv_cache_events=(
+            kv_events_config is not None and kv_events_config.enable_kv_cache_events
+        ),
+        extra_config=extra_config,
+        engine_id=engine_id,
+        model=OffloadingModelConfig(
+            name=vllm_config.model_config.model,
+            dtype=str(cache_dtype).removeprefix("torch."),
+        ),
+        cache=OffloadingCacheConfig(
+            tokens_per_hash=tokens_per_hash,
+            blocks_per_chunk=blocks_per_chunk,
+        ),
+        parallel=OffloadingParallelConfig(
+            rank=parallel_config.rank,
+            world_size=parallel_config.world_size,
+            tp_size=parallel_config.tensor_parallel_size,
+            pp_size=parallel_config.pipeline_parallel_size,
+            pcp_size=parallel_config.prefill_context_parallel_size,
+            dcp_size=parallel_config.decode_context_parallel_size,
+            data_parallel_index=parallel_config.data_parallel_index,
+            data_parallel_size=parallel_config.data_parallel_size,
+            data_parallel_rank_local=parallel_config.data_parallel_rank_local,
+            is_parallelism_agnostic=is_parallelism_agnostic,
+        ),
+        replicated_layout=replicated_layout,
+        canonical_layout=canonical_layout,
+    )

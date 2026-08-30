@@ -1,0 +1,98 @@
+--- dflash2/vllm/model_executor/models/qwen3_dflash.py	2026-08-28 00:27:23.959089541 -0400
++++ dflash2-quantattn/vllm/model_executor/models/qwen3_dflash.py	2026-08-30 08:28:45.954224135 -0400
+@@ -23,6 +23,9 @@
+     QKVParallelLinear,
+     ReplicatedLinear,
+     RowParallelLinear,
++    # PATCH (local, 2026-08-30): needed to detect whether qkv_proj still holds a
++    # plain [out, in] float weight that the fused context-KV GEMM can slice.
++    UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+@@ -442,6 +445,28 @@
+             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
+         return embeds
+ 
++    # PATCH (local, 2026-08-30): the fused context-KV GEMM below reads the raw
++    # qkv_proj.weight and row-slices the K/V rows out of it.  That is only legal
++    # while the weight is an unquantized [q+2kv, hidden] float matrix.  With a
++    # quantized attention checkpoint (e.g. the NVFP4-MLP/FP8-attention drafter)
++    # the parameter is fp8/packed-uint8 - and after
++    # process_weights_after_loading it may also be transposed or repacked into a
++    # kernel layout - so F.linear on it raises "expected mat1 and mat2 to have
++    # the same dtype".  This predicate decides, once at load time, which path to
++    # take.
++    @staticmethod
++    def _qkv_weight_is_raw(attn: nn.Module) -> bool:
++        qkv = attn.qkv_proj
++        if not isinstance(getattr(qkv, "quant_method", None), UnquantizedLinearMethod):
++            return False
++        w = getattr(qkv, "weight", None)
++        return (
++            isinstance(w, torch.Tensor)
++            and w.dim() == 2
++            and w.dtype in (torch.bfloat16, torch.float16, torch.float32)
++            and w.shape[0] == attn.q_size + 2 * attn.kv_size
++        )
++
+     def _build_context_kv_buffers(
+         self,
+         layers_attn: list[nn.Module],
+@@ -449,9 +474,19 @@
+     ) -> None:
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
+-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
++        # PATCH (local, 2026-08-30): keep the layer handles and the K/V column
++        # offset so the quantized path can run each qkv_proj's own forward.
++        self._layers_attn = layers_attn
++        self._kv_col_start = layers_attn[0].q_size
++        self._fused_kv_is_raw = all(self._qkv_weight_is_raw(a) for a in layers_attn)
++
++        if self._fused_kv_is_raw:
++            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
++            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
++            self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
++        else:
++            # PATCH (local, 2026-08-30): quantized qkv_proj - no raw fused copy.
++            self._fused_kv_weight = None
+         if has_bias:
+             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+@@ -523,9 +558,30 @@
+             self._hidden_norm_weight,
+             self._rms_norm_eps,
+         )
+-        all_kv_flat = F.linear(
+-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+-        )
++        if self._fused_kv_is_raw:
++            all_kv_flat = F.linear(
++                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
++            )
++        else:
++            # PATCH (local, 2026-08-30): quantized qkv_proj.  Run each layer's
++            # own forward (so its quant method / kernel applies) and keep the
++            # K/V columns of the output.  Column-slicing the full projection is
++            # mathematically identical to the raw row-sliced GEMM above -
++            # F.linear(x, W[q:])[..., j] == F.linear(x, W)[..., q + j] - and the
++            # per-layer results concatenate into exactly the same layer-major
++            # [num_ctx, L*2*kv_size] layout the view below expects.  The layer
++            # forward already adds its own bias, so _fused_kv_bias is not
++            # re-applied here.  The branch is on a Python bool fixed at load
++            # time, so this stays CUDA-graph / torch.compile safe (no host sync,
++            # no data-dependent control flow).
++            kv_start = self._kv_col_start
++            per_layer = []
++            for attn in self._layers_attn:
++                out = attn.qkv_proj(normed_context_states)
++                if isinstance(out, tuple):
++                    out = out[0]
++                per_layer.append(out[..., kv_start:])
++            all_kv_flat = torch.cat(per_layer, dim=-1)
+         # Single contiguous copy that separates K/V and transposes to
+         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
+         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.

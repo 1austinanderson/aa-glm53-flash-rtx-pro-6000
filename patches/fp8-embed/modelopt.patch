@@ -1,0 +1,148 @@
+--- fp8-embed/modelopt.pristine.py	2026-08-30 07:46:32.494646838 -0400
++++ fp8-embed/modelopt.py	2026-08-30 07:47:21.145702398 -0400
+@@ -81,7 +81,14 @@
+ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+     requantize_with_max_scale,
+ )
+-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++# PATCH (local, 2026-08-30): VocabParallelEmbedding is needed so a
++# MIXED_PRECISION config can hand the *input* embedding table an FP8 weight-only
++# quant method (ModelOptFp8RowEmbeddingMethod, below).  Importing it costs
++# nothing new -- ParallelLMHead is its subclass, so the module already loads.
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
+ from vllm.model_executor.parameter import (
+     BlockQuantScaleParameter,
+     ChannelQuantScaleParameter,
+@@ -2141,6 +2148,108 @@
+ ModelOptMxFp8Config.KVCacheMethodCls = ModelOptKVCacheMethod
+ 
+ 
++# PATCH (local, 2026-08-30): FP8 weight-only input-embedding table.
++#
++# Why: GLM-5.3-Flash keeps model.language_model.embed_tokens in BF16 --
++# 154880 x 4096 x 2 B = 1.18 GiB, i.e. 0.59 GiB resident per GPU at TP2 -- while
++# every other big tensor in the -4p67 checkpoint is already 4/8-bit.  An
++# embedding lookup is a gather, not a GEMM, so there is no kernel to match: we
++# can store the rows as float8_e4m3fn with one fp32 scale per vocab entry and
++# rescale the ~few-thousand gathered rows on the fly.  That halves the table
++# (plus 4 B/row of scale), freeing ~0.295 GiB per GPU at TP2 for KV cache.
++#
++# The method is only ever selected when the checkpoint's quantized_layers
++# declares the embedding module with quant_algo FP8_EMBED_ROW (see
++# ModelOptMixedPrecisionConfig.get_quant_method below), so BF16 embeddings and
++# every existing checkpoint keep the stock UnquantizedEmbeddingMethod path.
++class ModelOptFp8RowEmbeddingMethod(QuantizeMethodBase):
++    """FP8-e4m3 weight-only embedding table with per-row (per-token-id) scales.
++
++    Expected checkpoint structure (per embedding module):
++    - ``weight``: float8_e4m3fn, shape [vocab, hidden]
++    - ``weight_scale``: fp32, shape [vocab]  -- row r dequantizes as
++      ``weight[r].float() * weight_scale[r]``; the quantizer used
++      ``weight_scale[r] = amax(|row r|) / 448``.
++
++    Both parameters carry ``output_dim=0`` and the layer's own
++    ``weight_loader``, so VocabParallelEmbedding.weight_loader shards them over
++    the identical vocab range -- the FP8 weight and its scales can never drift
++    apart across TP ranks.
++    """
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        del input_size, output_size, params_dtype
++        num_rows = sum(output_partition_sizes)
++
++        # Plain Parameter + set_weight_attrs, exactly like
++        # UnquantizedEmbeddingMethod: VocabParallelEmbedding.weight_loader reads
++        # `output_dim` off the param and does its own narrow/copy, so the
++        # BasevLLMParameter machinery used by the linear methods is not wanted
++        # here.
++        weight = Parameter(
++            torch.empty(
++                num_rows, input_size_per_partition, dtype=torch.float8_e4m3fn
++            ),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, extra_weight_attrs)
++
++        weight_scale = Parameter(
++            torch.empty(num_rows, dtype=torch.float32),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight_scale, {"output_dim": 0})
++        layer.register_parameter("weight_scale", weight_scale)
++        set_weight_attrs(weight_scale, extra_weight_attrs)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        return
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        raise NotImplementedError(
++            "ModelOptFp8RowEmbeddingMethod is an embedding-only method; it is "
++            "never selected for a Linear/ParallelLMHead layer."
++        )
++
++    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor):
++        # Plain aten ops only (gather, convert, multiply) so this traces
++        # cleanly under torch.compile and is safe to capture in a CUDA graph:
++        # no data-dependent shapes, no host syncs, no custom kernels.
++        rows = torch.nn.functional.embedding(input_, layer.weight)
++        scales = layer.weight_scale[input_]
++        # Accumulate in fp32: the scale is fp32 in the checkpoint and rounding
++        # it to bf16 would add ~0.2% of avoidable error on top of e4m3's own
++        # rounding.  The temporary is [num_tokens, hidden] (32 MiB at the 2048
++        # max-num-batched-tokens this engine runs with).
++        out = rows.to(torch.float32) * scales.to(torch.float32).unsqueeze(-1)
++        return out.to(layer.params_dtype)
++
++    def tie_weights(
++        self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
++    ):
++        # Not reachable for GLM-5.3-Flash (tie_word_embeddings is false), but a
++        # tied lm_head would need the scales too, not just the fp8 rows.
++        layer.weight = embed_tokens.weight
++        layer.weight_scale = embed_tokens.weight_scale
++        return layer
++
++
+ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+     """Config class for ModelOpt MIXED_PRECISION.
+ 
+@@ -2388,6 +2497,20 @@
+ 
+         quant_algo = self._resolve_quant_algo(prefix)
+ 
++        # PATCH (local, 2026-08-30): input embedding table.  ParallelLMHead is a
++        # VocabParallelEmbedding subclass but is consumed as a GEMM by the
++        # sampler, so it must keep falling through to the LinearBase branch
++        # below -- only a plain VocabParallelEmbedding is eligible.  Returning
++        # None (the stock behaviour) leaves the table on
++        # UnquantizedEmbeddingMethod, so checkpoints without the
++        # FP8_EMBED_ROW entry are unaffected.
++        if isinstance(layer, VocabParallelEmbedding) and not isinstance(
++            layer, ParallelLMHead
++        ):
++            if quant_algo == "FP8_EMBED_ROW":
++                return ModelOptFp8RowEmbeddingMethod()
++            return None
++
+         if isinstance(layer, (LinearBase, ParallelLMHead)):
+             if quant_algo == "FP8":
+                 return ModelOptFp8LinearMethod(self.fp8_config)

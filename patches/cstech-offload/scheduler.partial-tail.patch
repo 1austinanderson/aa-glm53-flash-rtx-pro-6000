@@ -1,0 +1,550 @@
+--- /mnt/raid/glm53-flash/patches/cstech-offload/scheduler.mamba-align.py	2026-08-30 04:29:40.086507526 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-offload/scheduler.partial-tail.py	2026-08-30 05:29:36.603639845 -0400
+@@ -59,6 +59,16 @@
+ 
+ logger = init_logger(__name__)
+ 
++# PATCH (local, 2026-08-30): EAGLE/DFlash hit back-off in hash units. Upstream
++# drops ONE unit (896 tokens here) so the drafter gets hidden states for the
++# tail; DFlash-2's drafter attends over a 2,048-token sliding window whose KV
++# is NOT restored on a hit (draft group inert for offload / superseded local
++# tail), so <2,048 recomputed tokens leave it drafting from stale KV -- measured
++# 0/367 drafts accepted after a hit. 3 units (2,688-3,583 recomputed) keeps it
++# alive. Default 1 = upstream byte-for-byte.
++import os as _os
++_EAGLE_DROP_UNITS = max(1, int(_os.environ.get("VLLM_EAGLE_DROP_UNITS", "1")))
++
+ KV_LOAD_TIERS_KEY = "kv_load_tiers"
+ MATCHER_MEDIUM_KEY = "medium"
+ MATCHER_LOCALITY_KEY = "locality"
+@@ -111,6 +121,14 @@
+     # (built from kv_cache_config.kv_cache_groups) stay aligned. Marked by
+     # build_offloading_config as an OffloadingGroupConfig with layer_names=().
+     is_inert: bool = False
++    # PATCH (local, 2026-08-30): True only for a group that really holds a
++    # DRAFT model's KV, i.e. one the platform annotated with
++    # `KVCacheGroupSpec.is_eagle_group`. `is_eagle_group` above keeps its
++    # conservative meaning ("spec decoding is running, the trailing chunk of
++    # the offloadable range may still be rewritten") and still guards the
++    # STORE path; this flag guards the LOOKUP path. See the rationale block in
++    # SchedulerOffloadConfig.from_spec.
++    is_draft_group: bool = False
+ 
+ 
+ def get_sliding_window_size_in_chunks(
+@@ -246,15 +264,57 @@
+             vllm_config.speculative_config is not None
+             and vllm_config.speculative_config.use_eagle()
+         )
++        # PATCH (local, 2026-08-30): split the single eagle flag in two.
++        #
++        # `draft_groups` -- groups the platform ANNOTATED as holding a draft
++        # model's KV. `KVCacheGroupSpec.is_eagle_group` has exactly one producer
++        # in the tree, `_annotate_eagle_groups_deepseek_v4`
++        # (v1/core/kv_cache_utils.py), and it flags precisely the group that
++        # contains the MTP/draft attention layer. So "annotated" == "draft
++        # model group", exactly; an empty set means "we cannot name the draft
++        # group", NOT "every group is a draft group".
++        #
++        # `eagle_groups` -- unchanged conservative fallback (every group when
++        # spec decoding is on but nothing is annotated). It still drives the
++        # STORE path, where the guard is real and cheap:
++        # `_build_store_jobs` derives `num_offloadable_tokens` from
++        # `req.num_computed_tokens + num_scheduled_tokens`, and with spec
++        # decoding `num_scheduled_tokens` counts 1 + K OPTIMISTIC draft tokens
++        # that a rejection can roll back -- so a chunk that "completes" on
++        # optimistic tokens must not be stored. `storable_chunks` only applies
++        # it while decoding (`num_offloadable_tokens > num_prompt_tokens`), so
++        # a chunk completed during PREFILL is stored before the exclusion ever
++        # engages, and `advance_stored_idx`'s max() keeps the index from
++        # walking back over it.
++        #
++        # The LOOKUP-side drop (`_lookup_complete_chunks`) is restricted to
++        # `draft_groups`, i.e. to nothing at all on this box (GLM-5.3-Flash's
++        # only draft group is the DFlash-2 SlidingWindowSpec group, which
++        # config.sw-inert.py already marks inert). Reasons it is redundant for
++        # TARGET groups:
++        #   * Nothing volatile can be in the cache to begin with: the store
++        #     guard above is what keeps it out, and a poisoned key would be hit
++        #     as an INTERIOR chunk by any longer request, so dropping the
++        #     trailing chunk on lookup could not repair it anyway.
++        #   * The recompute EAGLE actually needs (hidden states for the last
++        #     accepted position) is one TOKEN, not one chunk, and is guaranteed
++        #     by the `num_tokens - 1` cap in `_lookup_complete_chunks`.
++        # Measured cost of the conservative fallback on this box (47,699-token
++        # prompt, KDA block 14,336, MLA chunk 3,584): the MLA group's hit is
++        # cut 43,008 -> 39,424 and the mamba align round-down then floors it to
++        # 28,672 -- one whole KDA chunk lost on every RAM hit.
++        draft_groups = set(eagle_groups)
+         if use_eagle and not eagle_groups:
+             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+ 
+         if eagle_groups:
+             logger.info(
+-                "KV offloading: EAGLE/MTP draft attention groups %s "
+-                "detected. The trailing chunk of these groups will be "
+-                "excluded from offloading due to volatility.",
++                "KV offloading: spec decoding active; the trailing chunk of "
++                "groups %s is excluded from STORE while decoding (volatile "
++                "under draft-token rejection). Annotated draft-model groups "
++                "(load-side trailing-chunk drop): %s.",
+                 sorted(eagle_groups),
++                sorted(draft_groups) or "none",
+             )
+ 
+         kv_group_configs_list: list[GroupOffloadConfig] = []
+@@ -305,6 +365,7 @@
+                     ),
+                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
+                     is_eagle_group=idx in eagle_groups,
++                    is_draft_group=idx in draft_groups,
+                     requires_cow_source=(
+                         isinstance(kv_spec, MambaSpec)
+                         and kv_spec.mamba_cache_mode == "align"
+@@ -316,29 +377,50 @@
+         active_group_configs = tuple(
+             config for config in kv_group_configs if not config.is_inert
+         )
+-        group_block_sizes = {config.tokens_per_block for config in active_group_configs}
+         has_partial_recurrent_group = any(
+             config.requires_cow_source
+             and config.tokens_per_block > spec.tokens_per_hash
+             for config in active_group_configs
+         )
+-        # Partial tails currently require one physical block per offload chunk
+-        # and uniform, non-windowed groups so one boundary identifies every
+-        # group's source. EAGLE and DCP need additional hand-off semantics.
++        # PATCH (local, 2026-08-30): generalise the partial-tail gate.
++        #
++        # Dropped `not inert_groups`: an inert group has no offloaded blocks,
++        # but it also needs none -- every boundary-key loop, store job, load
++        # slice and touch below now skips it and still emits its zero-sized
++        # GPULoadStoreSpec entry, exactly as the regular chunk path already
++        # does. Requiring zero inert groups disabled the optimization outright
++        # on GLM-5.3-Flash (kpool tail + DFlash-2 sliding window are inert).
++        #
++        # Dropped `len(group_block_sizes) == 1`: uniformity was only needed
++        # because upstream indexed every group's block table with one shared
++        # `boundary // tokens_per_block`. Each group now uses its own
++        # `cdiv(boundary, tokens_per_block) - 1` (MLA 3,584 vs KDA 14,336).
++        # What IS still required is a single copy-on-write block size, because
++        # that is the window the boundary must fall inside.
++        #
++        # `is_eagle_group` -> `is_draft_group`: the volatile trailing chunk of
++        # a DRAFT model's group cannot be handed off, but the conservative
++        # "every group is an eagle group" fallback must not veto the feature
++        # for the target model. See the rationale above.
++        cow_block_sizes = {
++            config.tokens_per_block
++            for config in active_group_configs
++            if config.requires_cow_source
++        }
+         supports_partial_tail = (
+-            # PATCH: the partial-tail hand-off indexes every group's block
+-            # table by one shared boundary; an inert group has no offloaded
+-            # blocks to hand off, so disable the optimization outright.
+-            not inert_groups
+-            and spec.blocks_per_chunk == 1
+-            and len(group_block_sizes) == 1
++            spec.blocks_per_chunk == 1
++            and len(cow_block_sizes) == 1
+             and has_partial_recurrent_group
+             and all(
+                 config.sliding_window_size_in_chunks is None
+                 or config.requires_cow_source
+                 for config in active_group_configs
+             )
+-            and not any(config.is_eagle_group for config in active_group_configs)
++            and all(
++                config.tokens_per_block % spec.tokens_per_hash == 0
++                for config in active_group_configs
++            )
++            and not any(config.is_draft_group for config in active_group_configs)
+             and vllm_config.parallel_config.decode_context_parallel_size == 1
+         )
+ 
+@@ -582,15 +664,41 @@
+         self._mamba_align_size: int | None = resolve_mamba_align_size(
+             spec, kv_cache_config
+         )
+-        self._partial_tail_block_size = (
+-            self.config.kv_group_configs[0].tokens_per_block
+-            if self.config.supports_partial_tail
+-            else 0
+-        )
+         self._cow_source_groups = frozenset(
+             config.group_idx
+             for config in self.config.kv_group_configs
+-            if config.requires_cow_source
++            if config.requires_cow_source and not config.is_inert
++        )
++        # PATCH (local, 2026-08-30): the hand-off boundary lives INSIDE one
++        # block of the copy-on-write (mamba "align") group, so the search
++        # window is THAT group's block, not kv_group_configs[0]'s -- upstream
++        # could use group 0 only because it also required one uniform block
++        # size across groups. Here group 0 is MLA (3,584) while the recurrent
++        # state block is 14,336, and using 3,584 would cap the scan a whole
++        # KDA block short. `from_spec` guarantees exactly one such size.
++        self._partial_tail_block_size = 0
++        if self.config.supports_partial_tail:
++            _cow_block_sizes = {
++                config.tokens_per_block
++                for config in self.config.kv_group_configs
++                if config.requires_cow_source and not config.is_inert
++            }
++            assert len(_cow_block_sizes) == 1
++            self._partial_tail_block_size = _cow_block_sizes.pop()
++        # PATCH (local, 2026-08-30): mirror the GPU-side eagle back-off.
++        # MambaManager._cache_partial_tail_block (overlay
++        # patches/cstech-partial-tail/single_type_kv_cache_manager.py)
++        # registers the tail at `last_prompt_hash_boundary - hash_block_size`
++        # exactly when its own `use_eagle` is set, and the coordinator sets
++        # that from `KVCacheGroupSpec.is_eagle_group` with the same
++        # "flag everything when nothing is annotated" fallback
++        # (v1/core/kv_cache_coordinator.py). Reproduce the predicate here so
++        # the scan starts at the boundary that is actually stored instead of
++        # burning one lookup round per group on the un-backed-off one.
++        self._eagle_tail_backoff = (
++            vllm_config.speculative_config is not None
++            and vllm_config.speculative_config.use_eagle()
++            and not any(g.is_eagle_group for g in kv_cache_config.kv_cache_groups)
+         )
+ 
+         self._req_status: dict[ReqId, RequestOffloadState] = {}
+@@ -751,7 +859,11 @@
+                         group.group_idx,
+                         req_status.partial_tail_boundary,
+                     )
++                    # PATCH (local, 2026-08-30): an inert group has no boundary
++                    # key -- touching one would be a lookup against a key that
++                    # was never stored.
+                     for group in self.config.kv_group_configs
++                    if not group.is_inert
+                 ),
+                 req_status.req_context,
+             )
+@@ -767,11 +879,24 @@
+         """
+         num_computed_tokens = req_status.num_locally_computed_tokens
+         max_hit_size_tokens: int = req_status.req.num_tokens
+-        if self._sliding_window_groups:
++        if self._sliding_window_groups or self._eagle_tail_backoff:
+             # the last prompt token has to be recomputed to get the logprobs
+             # for sliding window attention, we must reduce by 1 to make sure
+             # we still have a hit after reduction
++            # PATCH (local, 2026-08-30): also apply the -1 when the eagle
++            # trailing-chunk drop below has been narrowed to draft-model groups
++            # (see from_spec). EAGLE needs the hidden states of the last
++            # accepted position, which means at least one token must be
++            # recomputed -- one TOKEN, which this guarantees, not one chunk.
+             max_hit_size_tokens -= 1
++        if self._eagle_tail_backoff:
++            # PATCH (local, 2026-08-30): same N-unit back-off as the GPU path,
++            # so a complete-chunk RAM hit never lands within the drafter's
++            # window of the prompt end either.
++            max_hit_size_tokens = min(
++                max_hit_size_tokens,
++                req_status.req.num_tokens - self.config.tokens_per_hash * _EAGLE_DROP_UNITS,
++            )
+         if self._mamba_align_size is not None:
+             # Constrain hit-window to the mamba block size.
+             # PATCH (local, 2026-08-30): unconditional, not only with SW groups.
+@@ -803,8 +928,13 @@
+                     len(offload_keys) >= req_status.req.num_tokens // tokens_per_chunk
+                 )
+ 
++                # PATCH (local, 2026-08-30): only a real draft-model group drops
++                # its trailing chunk on lookup (see from_spec). With the
++                # conservative "every group" fallback this cost the MLA group
++                # 3,584 tokens, which the mamba round-down below then amplified
++                # to a whole 14,336-token KDA chunk.
+                 is_eagle_unverified = (
+-                    group_config.is_eagle_group and group_idx not in eagle_verified
++                    group_config.is_draft_group and group_idx not in eagle_verified
+                 )
+ 
+                 # Constrain to a chunk-aligned boundary for this group.
+@@ -891,7 +1021,8 @@
+                     return 0
+ 
+                 if new_num_hit_tokens < num_hit_tokens:
+-                    if not group_config.is_eagle_group:
++                    # PATCH (local, 2026-08-30): pairs with is_draft_group above.
++                    if not group_config.is_draft_group:
+                         eagle_verified.clear()
+                     if defer_lookup:
+                         # make another iteration on all groups to check
+@@ -954,6 +1085,66 @@
+         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
+         return make_offload_key(request.block_hashes[hash_idx], group_idx)
+ 
++    def _boundary_block_idx(
++        self, group_config: GroupOffloadConfig, boundary: int
++    ) -> int:
++        """Index of the block that must hold this group's KV/state at `boundary`.
++
++        PATCH (local, 2026-08-30): per-group, because block sizes are not
++        uniform here (MLA 3,584, KDA 14,336). ``cdiv - 1`` collapses to the last
++        REGULAR chunk when the boundary is an exact multiple of the group's
++        block (46,592 = 13 x 3,584 for MLA) and to the partial block otherwise
++        (46,592 = 3 x 14,336 + 3,584 for KDA). In the first case
++        ``_make_boundary_key(boundary)`` resolves to hash index
++        ``boundary // tokens_per_hash - 1``, which is byte-for-byte the key
++        ``update_offload_keys`` already assigned to that chunk
++        (``block_hashes[hashes_per_chunk * chunk + hashes_per_chunk - 1]``), so
++        the boundary key and the chunk key are the SAME key and nothing is
++        loaded or stored twice.
++        """
++        return cdiv(boundary, group_config.tokens_per_block) - 1
++
++    def _boundary_probe_keys(
++        self,
++        req_status: RequestOffloadState,
++        group_config: GroupOffloadConfig,
++        complete_boundary: int,
++        boundary: int,
++    ) -> list[OffloadKey] | None:
++        """Keys this group needs before `boundary` is a valid resume point.
++
++        PATCH (local, 2026-08-30): upstream probed exactly one key per group,
++        which is only sufficient when the complete-chunk hit already verified
++        everything below the boundary. It does not here: `_lookup_complete_chunks`
++        rounds the complete hit DOWN to the mamba align size (14,336), so a
++        finer group's regular chunks between the complete hit and the candidate
++        boundary (MLA 3,584) were never looked up. Probe them:
++          * full-attention group: every regular chunk in
++            [complete_boundary, boundary) plus the boundary block;
++          * windowed group (mamba w == 1, SWA w > 1): only the last w blocks
++            ending at the boundary -- earlier chunks are unreachable for it and
++            `_sliding_window_lookup` never asks for them.
++        Returns None when a needed key does not exist yet for this request.
++        """
++        offload_keys = req_status.group_states[group_config.group_idx].offload_keys
++        end_idx = self._boundary_block_idx(group_config, boundary)
++        if end_idx < 0 or end_idx > len(offload_keys):
++            return None
++        hash_idx = boundary // self.config.tokens_per_hash - 1
++        if hash_idx < 0 or hash_idx >= len(req_status.req.block_hashes):
++            return None
++        window = group_config.sliding_window_size_in_chunks
++        if window is None:
++            first_idx = complete_boundary // group_config.tokens_per_block
++        else:
++            first_idx = max(0, end_idx - (window - 1))
++        first_idx = min(first_idx, end_idx)
++        keys = list(offload_keys[first_idx:end_idx])
++        keys.append(
++            self._make_boundary_key(req_status.req, group_config.group_idx, boundary)
++        )
++        return keys
++
+     def _lookup(self, req_status: RequestOffloadState) -> int | None:
+         complete_hit = self._lookup_complete_chunks(req_status)
+         req_status.partial_tail_boundary = None
+@@ -967,6 +1158,18 @@
+         max_boundary = round_down(
+             min(req_status.req.num_prompt_tokens - 1, block_end - 1), tokens_per_hash
+         )
++        if self._eagle_tail_backoff:
++            # PATCH (local, 2026-08-30): under EAGLE/MTP the producer registers
++            # its partial tail one hash unit BEFORE the prompt's last hash
++            # boundary (MambaManager._cache_partial_tail_block overlay), because
++            # the attention groups' eagle drop lands there. Start the scan at
++            # that boundary: anything above it was never stored, and the drafter
++            # gets its hidden states from the recomputed tail.
++            max_boundary = min(
++                max_boundary,
++                round_down(req_status.req.num_prompt_tokens, tokens_per_hash)
++                - tokens_per_hash,
++            )
+         if max_boundary <= complete_boundary:
+             return complete_hit
+ 
+@@ -974,24 +1177,38 @@
+         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
+             boundary_pending = False
+             boundary_missed = False
+-            boundary_keys = []
++            # (group_config, boundary key) for the event tracker; probe_keys
++            # additionally carries the intermediate regular chunks.
++            boundary_keys: list[tuple[GroupOffloadConfig, OffloadKey]] = []
++            probe_keys: list[OffloadKey] = []
+             for group_config in self.config.kv_group_configs:
+-                key = self._make_boundary_key(
+-                    req_status.req, group_config.group_idx, boundary
++                if group_config.is_inert:
++                    # PATCH (local, 2026-08-30): never stored, so it can never
++                    # hit; probing it would veto every boundary. Its GPU blocks
++                    # stay freshly allocated, exactly as after a GPU prefix-cache
++                    # hit (it opts out of prefix caching).
++                    continue
++                keys = self._boundary_probe_keys(
++                    req_status, group_config, complete_boundary, boundary
+                 )
+-                boundary_keys.append(key)
+-                result = self.manager.lookup(key, req_status.req_context)
+-                if result is LookupResult.MISS:
++                if keys is None:
+                     boundary_missed = True
+                     break
+-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+-                    boundary_pending = True
++                boundary_keys.append((group_config, keys[-1]))
++                probe_keys.extend(keys)
++
++            if not boundary_missed:
++                for key in probe_keys:
++                    result = self.manager.lookup(key, req_status.req_context)
++                    if result is LookupResult.MISS:
++                        boundary_missed = True
++                        break
++                    if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
++                        boundary_pending = True
+ 
+             pending |= boundary_pending
+             if not boundary_missed and not boundary_pending:
+-                for group_config, key in zip(
+-                    self.config.kv_group_configs, boundary_keys
+-                ):
++                for group_config, key in boundary_keys:
+                     self._events_tracker.record_partial_lookup(
+                         req_status.req, group_config, boundary, key
+                     )
+@@ -1142,6 +1359,25 @@
+                     num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                 )
+                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
++                # PATCH (local, 2026-08-30): this is exactly "[chunks fully
++                # below the boundary block] + [the boundary block]", per group,
++                # with NON-uniform block sizes. With blocks_per_chunk == 1
++                # (required by supports_partial_tail) tokens_per_chunk ==
++                # tokens_per_block, so num_chunks - 1 == cdiv(boundary,
++                # tokens_per_block) - 1 == this group's boundary block index.
++                # When the boundary is an exact multiple of the group's block
++                # (MLA: 46,592 = 13 x 3,584) that index IS the last regular
++                # chunk and `_make_boundary_key` returns that chunk's own key,
++                # so the slice + append still names each chunk exactly once --
++                # no double load. The key count stays equal to
++                # num_pending_gpu_blocks in both cases:
++                #   (num_chunks - 1 - start) + 1 == num_chunks - start
++                #                               == num_gpu_blocks - start.
++                assert (
++                    partial_tail_boundary is None
++                    or end_chunk_idx
++                    == self._boundary_block_idx(group_config, partial_tail_boundary)
++                )
+                 assert len(offload_keys) >= end_chunk_idx
+                 keys_to_load.extend(offload_keys[start_chunk_idx:end_chunk_idx])
+                 if partial_tail_boundary is not None:
+@@ -1158,6 +1394,16 @@
+                 ]
+             )
+             group_sizes.append(num_pending_gpu_blocks)
++            # PATCH (local, 2026-08-30): for the mamba "align" group with no
++            # local GPU hit this is `boundary // tokens_per_block` (the leading
++            # placeholders are null blocks, which the scan above steps over), so
++            # the boundary state is written into block index
++            # `boundary // mamba_block_size`. That is the same slot the runner
++            # reads: mamba_hybrid.py seeds `_mamba_state_idx` with
++            # `(num_computed_tokens - 1) // mamba_block_size`, and for a
++            # boundary that is not a multiple of mamba_block_size the two
++            # expressions agree (e.g. 46,592 // 14,336 == 3 ==
++            # (46,592 - 1) // 14,336).
+             block_indices.append(num_locally_computed_gpu_blocks)
+ 
+             # Skip prefix-hit chunks for block-level policy; for
+@@ -1269,23 +1515,44 @@
+             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
+             assert self._cow_source_groups.issubset(cow_blocks)
+ 
++            # PATCH (local, 2026-08-30): per-group block index, inert groups
++            # skipped. The boundary sits inside ONE block of the copy-on-write
++            # (mamba "align") group -- that is what `_partial_tail_block_size`
++            # bounds -- but every other group indexes its own block table with
++            # its own block size: `cdiv(boundary, tokens_per_block) - 1`. For
++            # MLA (3,584) and boundary 46,592 that is block 12, which is also
++            # the group's last REGULAR chunk, and `_make_boundary_key` returns
++            # that chunk's own key; `prepare_store` then filters it out if the
++            # regular store path already put it in the pool, so no byte moves
++            # twice. Inert groups (kpool tail, DFlash-2 sliding window) have no
++            # block table entry to hand off and still get their zero-sized
++            # GPULoadStoreSpec slot below.
+             assert boundary % self._partial_tail_block_size != 0
+-            block_idx = boundary // self._partial_tail_block_size
++            active_groups = [
++                group for group in self.config.kv_group_configs if not group.is_inert
++            ]
++            block_idx_by_group = {
++                group.group_idx: self._boundary_block_idx(group, boundary)
++                for group in active_groups
++            }
+             if any(
+                 group.group_idx not in self._cow_source_groups
+-                and block_idx >= len(req_status.group_states[group.group_idx].block_ids)
+-                for group in self.config.kv_group_configs
++                and block_idx_by_group[group.group_idx]
++                >= len(req_status.group_states[group.group_idx].block_ids)
++                for group in active_groups
+             ):
+                 continue
+             keys = [
+                 self._make_boundary_key(req, group.group_idx, boundary)
+-                for group in self.config.kv_group_configs
++                for group in active_groups
+             ]
+             block_ids = [
+                 cow_blocks[group.group_idx]
+                 if group.group_idx in self._cow_source_groups
+-                else req_status.group_states[group.group_idx].block_ids[block_idx]
+-                for group in self.config.kv_group_configs
++                else req_status.group_states[group.group_idx].block_ids[
++                    block_idx_by_group[group.group_idx]
++                ]
++                for group in active_groups
+             ]
+             assert all(block_id != 0 for block_id in block_ids)
+ 
+@@ -1298,20 +1565,39 @@
+             if not store_output.keys_to_store:
+                 continue
+ 
+-            for group_config, key in zip(self.config.kv_group_configs, keys):
++            for group_config, key in zip(active_groups, keys):
+                 if key in store_output.keys_to_store:
+                     self._events_tracker.record_partial_store(
+                         req, group_config, boundary, key
+                     )
+ 
+-            group_by_key = {key: idx for idx, key in enumerate(keys)}
++            group_by_key = {
++                key: group.group_idx for key, group in zip(keys, active_groups)
++            }
+             accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
++            # PATCH (local, 2026-08-30): the worker walks groups in index order
++            # and consumes `block_ids` sequentially, while `dst_spec` is built
++            # from `keys_to_store` in the manager's order -- so the two only
++            # line up if `keys_to_store` preserved the group order we passed in.
++            # Upstream relies on that silently; refuse the hand-off instead of
++            # writing a mis-paired transfer.
++            if accepted_groups != sorted(accepted_groups):
++                logger.warning(
++                    "Request %s: offloading manager reordered the partial-tail "
++                    "store keys (%s); skipping the hand-off.",
++                    req_id,
++                    accepted_groups,
++                )
++                continue
++            block_id_by_group = dict(
++                zip((group.group_idx for group in active_groups), block_ids)
++            )
+             group_sizes = [0] * len(self.config.kv_group_configs)
+             block_indices = [0] * len(self.config.kv_group_configs)
+             for group_idx in accepted_groups:
+                 group_sizes[group_idx] = 1
+-                block_indices[group_idx] = block_idx
+-            source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
++                block_indices[group_idx] = block_idx_by_group[group_idx]
++            source_blocks = [block_id_by_group[group_idx] for group_idx in accepted_groups]
+ 
+             job_id = self._generate_job_id()
+             req_status.transfer_jobs.add(job_id)

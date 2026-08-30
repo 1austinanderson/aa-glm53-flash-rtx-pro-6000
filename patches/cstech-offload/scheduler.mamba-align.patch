@@ -1,0 +1,45 @@
+--- /mnt/raid/glm53-flash/patches/cstech-offload/scheduler.py	2026-08-28 07:03:27.055158380 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-offload/scheduler.mamba-align.py	2026-08-30 04:29:40.086507526 -0400
+@@ -772,11 +772,12 @@
+             # for sliding window attention, we must reduce by 1 to make sure
+             # we still have a hit after reduction
+             max_hit_size_tokens -= 1
+-            if self._mamba_align_size is not None:
+-                # Constrain hit-window to the mamba block size.
+-                max_hit_size_tokens = round_down(
+-                    max_hit_size_tokens, self._mamba_align_size
+-                )
++        if self._mamba_align_size is not None:
++            # Constrain hit-window to the mamba block size.
++            # PATCH (local, 2026-08-30): unconditional, not only with SW groups.
++            max_hit_size_tokens = round_down(
++                max_hit_size_tokens, self._mamba_align_size
++            )
+ 
+         num_hit_tokens: int = 0
+         defer_lookup = False
+@@ -865,6 +866,24 @@
+                         max_hit_size_tokens,
+                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                     )
++                    # PATCH (local, 2026-08-30): keep the candidate hit on the
++                    # mamba state-checkpoint grid INSIDE the convergence loop.
++                    # A group whose chunk is finer than the mamba align size
++                    # (MLA 3,584 / draft SW 896 vs KDA 14,336 with
++                    # --mamba-block-size 14336) can tighten the bound to a
++                    # position where no recurrent state was ever stored; the
++                    # KDA group's own lookup would then be asked for
++                    # cdiv(bound, 14336) chunks and the load would fetch the
++                    # state of a LATER token position (silent wrong output).
++                    # Re-rounding here (not after the loop) makes the shrink
++                    # visible to the existing re-verification logic, so the
++                    # sliding-window groups are re-checked at the new boundary.
++                    # Inert whenever every group's chunk is a multiple of the
++                    # align size (the default 3,584 config).
++                    if self._mamba_align_size is not None:
++                        max_hit_size_tokens = round_down(
++                            max_hit_size_tokens, self._mamba_align_size
++                        )
+ 
+                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                 if new_num_hit_tokens < tokens_per_chunk:

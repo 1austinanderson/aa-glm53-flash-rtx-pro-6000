@@ -1,0 +1,61 @@
+--- /mnt/raid/glm53-flash/patches/cstech-mamba-interval/sched_scheduler.py	2026-08-28 06:39:25.069402812 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-mamba-interval/sched_scheduler.partial-tail.py	2026-08-30 05:30:39.646749575 -0400
+@@ -65,6 +65,16 @@
+ 
+ logger = init_logger(__name__)
+ 
++# PATCH (local, 2026-08-30): EAGLE/DFlash hit back-off in hash units. Upstream
++# drops ONE unit (896 tokens here) so the drafter gets hidden states for the
++# tail; DFlash-2's drafter attends over a 2,048-token sliding window whose KV
++# is NOT restored on a hit (draft group inert for offload / superseded local
++# tail), so <2,048 recomputed tokens leave it drafting from stale KV -- measured
++# 0/367 drafts accepted after a hit. 3 units (2,688-3,583 recomputed) keeps it
++# alive. Default 1 = upstream byte-for-byte.
++import os as _os
++_EAGLE_DROP_UNITS = max(1, int(_os.environ.get("VLLM_EAGLE_DROP_UNITS", "1")))
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -427,6 +437,41 @@
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        # PATCH (local, 2026-08-30): under EAGLE/MTP the partial-tail stop moves
++        # one hash unit earlier, to stay in lock-step with
++        # MambaManager._cache_partial_tail_block (overlay
++        # patches/cstech-partial-tail/single_type_kv_cache_manager.py), which
++        # now registers the tail at `last_prompt_hash_boundary -
++        # hash_block_size`. That manager only registers the entry when the step
++        # ends EXACTLY on its boundary (`if num_tokens != boundary: return
++        # None`), so if this split still stopped at the un-backed-off boundary
++        # the tail would never be registered at all.
++        #
++        # Why the manager backs off: the coordinator runs the full-attention
++        # group first and an eagle group matches one extra unit and drops it, so
++        # the Mamba finder is called with `max_length = last_hash_boundary -
++        # hash_block_size` and can never reach a tail registered above that.
++        # Evidence (GLM-5.3-Flash, 47,699-token prompt, hash 896, KDA block
++        # 14,336): GPU prefix hit was 43,008 instead of 46,592.
++        #
++        # The mamba STATE stride is `cache_config.mamba_block_size` (set by the
++        # platform in align mode); `block_size` above is deliberately the finer
++        # engine-core value unless --mamba-block-size was given, so it must not
++        # be used for the "already a whole state block" test.
++        if tail_boundary and self.use_eagle:
++            _mamba_state_block = (
++                self.cache_config.mamba_block_size or self.cache_config.block_size
++            )
++            # (inline env read: this function is exec'd standalone by the CPU
++            # dry-run harness, so no module-level name is used here)
++            tail_boundary -= self.hash_block_size * max(
++                1, int(__import__("os").environ.get("VLLM_EAGLE_DROP_UNITS", "1"))
++            )
++            if tail_boundary <= 0 or tail_boundary % _mamba_state_block == 0:
++                # Nothing to register: either the prompt is shorter than two
++                # hash units, or the backed-off boundary is a whole state block
++                # (cached by the regular full-block path, no partial tail).
++                tail_boundary = 0
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.

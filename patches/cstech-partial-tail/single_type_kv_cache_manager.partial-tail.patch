@@ -1,0 +1,72 @@
+--- /mnt/raid/glm53-flash/patches/cstech-partial-tail/single_type_kv_cache_manager.pristine.py	2026-08-30 04:58:13.816859820 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-partial-tail/single_type_kv_cache_manager.py	2026-08-30 05:29:36.602463253 -0400
+@@ -37,6 +37,16 @@
+ 
+ logger = init_logger(__name__)
+ 
++# PATCH (local, 2026-08-30): EAGLE/DFlash hit back-off in hash units. Upstream
++# drops ONE unit (896 tokens here) so the drafter gets hidden states for the
++# tail; DFlash-2's drafter attends over a 2,048-token sliding window whose KV
++# is NOT restored on a hit (draft group inert for offload / superseded local
++# tail), so <2,048 recomputed tokens leave it drafting from stale KV -- measured
++# 0/367 drafts accepted after a hit. 3 units (2,688-3,583 recomputed) keeps it
++# alive. Default 1 = upstream byte-for-byte.
++import os as _os
++_EAGLE_DROP_UNITS = max(1, int(_os.environ.get("VLLM_EAGLE_DROP_UNITS", "1")))
++
+ 
+ class SingleTypeKVCacheManager(ABC):
+     """
+@@ -768,7 +778,7 @@
+         # append-only, so it still covers the reduced length), else one cache
+         # block.
+         if drop_eagle_block and hit_length > 0:
+-            hit_length -= min(alignment_tokens, block_size)
++            hit_length -= min(alignment_tokens * _EAGLE_DROP_UNITS, block_size)
+         # Round down to the alignment; a no-op when fine-grained (hits land on
+         # hash boundaries by construction) and when alignment_tokens ==
+         # block_size. Then trim blocks past the new tail.
+@@ -1844,6 +1854,43 @@
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
++        # PATCH (local, 2026-08-30): under EAGLE/MTP register the partial tail
++        # one hash unit EARLIER than the prompt's last hash boundary.
++        #
++        # Why: HybridKVCacheCoordinator.find_longest_cache_hit runs the
++        # full-attention group first, and an eagle group matches one extra unit
++        # and then drops it (FullAttentionManager.find_longest_cache_hit:
++        # ``hit_length -= min(alignment_tokens, block_size)``), so
++        # ``curr_hit_length`` is already ``latest_prompt_hash_boundary -
++        # hash_block_size`` by the time the Mamba group is searched. This
++        # manager's finder is then called with ``max_length = curr_hit_length``
++        # -- the coordinator gives mamba NO eagle margin ("No margin for mamba:
++        # its finder never drops") -- so a tail registered AT
++        # ``latest_prompt_hash_boundary`` is out of range, and the right-to-left
++        # scan falls back to the previous whole-block boundary.
++        #
++        # Measured on GLM-5.3-Flash (11 MLA @3,584 + 34 KDA @14,336 with
++        # --mamba-block-size 14336, hash 896, DFlash-2 K=3): 47,699-token prompt
++        # re-sent -> prompt tail 47,488, MLA eagle drop lands on 46,592, KDA tail
++        # at 47,488 unreachable, GPU hit falls back to 43,008 (= 3 x 14,336).
++        # A 5,000-token prompt loses the hit entirely (tail 4,480, MLA drop ->
++        # 3,584, no KDA state at or below 3,584 -> GPU hit 0).
++        #
++        # Backing the registration off by exactly one hash unit puts it where
++        # the attention group's drop lands, so the Mamba finder can return it.
++        # The 896 recomputed tokens are what EAGLE wants anyway: the recomputed
++        # tail regenerates the hidden states the drafter consumes.
++        if self.use_eagle:
++            latest_prompt_hash_boundary -= hash_block_size * _EAGLE_DROP_UNITS
++            if latest_prompt_hash_boundary <= 0:
++                # Prompt shorter than two hash units: nothing to register.
++                return None
++            if latest_prompt_hash_boundary % self.block_size == 0:
++                # The backed-off boundary is a regular block boundary; that
++                # state is already cached by the full-block path, and
++                # registering it as a "partial" tail would force a pointless
++                # copy-on-write in allocate_new_blocks.
++                return None
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 

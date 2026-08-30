@@ -1,0 +1,24 @@
+--- /mnt/raid/glm53-flash/patches/cstech-kda-state/mamba_utils.pristine.py	2026-08-30 06:36:00.026902947 -0400
++++ /mnt/raid/glm53-flash/patches/cstech-kda-state/mamba_utils.py	2026-08-30 06:36:00.037542145 -0400
+@@ -134,6 +134,21 @@
+         mamba_cache_dtype: MambaDType,
+     ) -> tuple[torch.dtype, torch.dtype]:
+         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
++        # PATCH (local, 2026-08-30): the KDA recurrent (temporal) state is
++        # pinned to fp32 here regardless of --mamba-cache-dtype /
++        # --mamba-ssm-cache-dtype. On GLM-5.3-Flash that state is 64 heads x
++        # 128 x 128 per layer (4 MB fp32, 2 MB per TP2 rank) and sets the
++        # shared KV page size for EVERY group, so it is the whole per-request
++        # fixed cost of DFlash (4 KDA groups x (2+K) full rows) and half the
++        # RAM offload cost. VLLM_KDA_STATE_DTYPE=bfloat16 halves it (experiment;
++        # quality of the running recurrent state over long contexts must be
++        # checked). Unset = upstream fp32, byte-identical.
++        import os as _os
++        _override = _os.environ.get("VLLM_KDA_STATE_DTYPE", "").strip().lower()
++        if _override in ("bfloat16", "bf16"):
++            return (state_dtype, torch.bfloat16)
++        if _override in ("float16", "fp16", "half"):
++            return (state_dtype, torch.float16)
+         return (state_dtype, torch.float32)
+ 
+ 

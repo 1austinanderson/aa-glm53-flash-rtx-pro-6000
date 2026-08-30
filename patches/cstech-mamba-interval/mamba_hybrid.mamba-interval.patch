@@ -1,0 +1,32 @@
+--- mamba_hybrid.pristine.py	2026-08-25 22:41:50.000000000 -0400
++++ mamba_hybrid.py	2026-08-28 06:39:25.068967132 -0400
+@@ -100,8 +100,28 @@
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
+         if self._align_mode:
+             # Seed the running state block from the resumed/prefilled position.
++            # PATCH (local, 2026-08-28): this index is a column of the MAMBA
++            # group's block table, and the running kernel derives the same
++            # column from `mamba_spec.block_size`
++            # (`MAMBA_BLOCK_SIZE=mamba_spec.block_size` below, and
++            # `cdiv(computed_after, MAMBA_BLOCK_SIZE) - 1` in
++            # `preprocess_mamba_align_fused_kernel`). Upstream seeds it with
++            # `cache_config.block_size`, which is only correct because the
++            # platform pins `mamba_block_size == block_size` in align mode.
++            # Once the mamba state is checkpointed every N attention blocks
++            # the two diverge by N and the seed indexes past the end of the
++            # (now N-times shorter) block-table row -- reading another
++            # request's row, or out of bounds. Gated on the explicit
++            # --mamba-block-size opt-in so the default path is
++            # byte-identical to upstream.
++            mamba_block_size = self.cache_config.block_size
++            if (
++                self.cache_config.user_specified_mamba_block_size
++                and self.cache_config.mamba_block_size
++            ):
++                mamba_block_size = self.cache_config.mamba_block_size
+             self._mamba_state_idx_gpu[req_index].fill_(
+-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
++                (new_req_data.num_computed_tokens - 1) // mamba_block_size
+             )
+ 
+     def _get_mamba_group_info(

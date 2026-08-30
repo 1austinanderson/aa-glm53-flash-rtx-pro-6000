@@ -1,0 +1,52 @@
+--- interface.pristine.py	2026-08-25 22:41:50.000000000 -0400
++++ interface.py	2026-08-28 06:23:35.410259523 -0400
+@@ -930,7 +930,48 @@
+             )
+ 
+         if cache_config.mamba_cache_mode == "align":
+-            cache_config.mamba_block_size = cache_config.block_size
++            # Upstream pins the mamba state-checkpoint interval to the
++            # attention block size. Honour an explicit --mamba-block-size that
++            # is a positive integer multiple of the (final) attention block
++            # size: the recurrent state is then snapshotted every N attention
++            # blocks instead of every one. The state page is a fixed size
++            # regardless of the interval, so this cuts the number of state
++            # pages -- and therefore the host-RAM cost of KV offload, which
++            # stores a snapshot of every mamba layer per block -- by N, at the
++            # price of recomputing at most one interval of recurrent state
++            # after a prefix-cache hit (cheap: KDA/linear-attention prefill).
++            # Any other value (unset, non-multiple, non-positive) keeps the
++            # upstream behaviour byte-identical.
++            aligned_mamba_block_size = cache_config.block_size
++            if (
++                mamba_block_size is not None
++                and mamba_block_size > 0
++                and mamba_block_size % aligned_mamba_block_size == 0
++            ):
++                if mamba_block_size != aligned_mamba_block_size:
++                    logger.info(
++                        "Honoring user-specified mamba_block_size=%d in "
++                        "'align' cache mode: the mamba state is checkpointed "
++                        "every %d attention blocks of %d tokens.",
++                        mamba_block_size,
++                        mamba_block_size // aligned_mamba_block_size,
++                        aligned_mamba_block_size,
++                    )
++                cache_config.mamba_block_size = mamba_block_size
++            else:
++                if (
++                    mamba_block_size is not None
++                    and mamba_block_size != aligned_mamba_block_size
++                ):
++                    logger.warning(
++                        "Ignoring user-specified mamba_block_size=%d in "
++                        "'align' cache mode: it must be a positive multiple "
++                        "of the attention block size %d. Using %d.",
++                        mamba_block_size,
++                        aligned_mamba_block_size,
++                        aligned_mamba_block_size,
++                    )
++                cache_config.mamba_block_size = aligned_mamba_block_size
+ 
+         # Pad mamba page size to exactly match attention page size
+         attn_page_size = cache_config.block_size * attn_page_size_1_token
