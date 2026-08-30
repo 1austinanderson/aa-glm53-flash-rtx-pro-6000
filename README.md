@@ -1,8 +1,10 @@
 # GLM-5.3-Flash (320B-A18B, NVFP4/MXFP8) on 2× RTX PRO 6000 Blackwell — how it was made to work
 
-Two RTX PRO 6000 Blackwell Workstation cards (96 GB each, SM120) on PCIe Gen5, TP2, no NVLink. Result: GLM-5.3-Flash at a
-**384k-token context window**, DFlash-2 speculative decoding, **~150 tok/s single-stream / ~355 tok/s at 4 streams**,
-**~5.1k tok/s prefill**, served over the usual OpenAI-compatible API. Everything below is what it actually took, in order, with the
+Two RTX PRO 6000 Blackwell Workstation cards (96 GB each, SM120) on PCIe Gen5, TP2, no NVLink. Result (v2, 2026-08-30): GLM-5.3-Flash
+at a **360k-token context window with a 512k-token GPU KV pool plus a ~1.2M-token host-RAM tier**, DFlash-2 speculative decoding,
+**~160 tok/s single-stream / ~365 tok/s at 4 streams / ~530–560 at 8**, **~5.5k tok/s prefill**, re-sends and multi-turn continuations
+resuming from the prompt end in ~0.6 s, served over the usual OpenAI-compatible API. v1 (2026-08-28) was a 384k window with a 430k-token
+pool at ~150 / ~355 tok/s and ~5.1k prefill; the v2 section below explains each step from there. Everything below is what it actually took, in order, with the
 failure that motivated each step. All patches are small bind-mounted overlays on a public image — nothing is rebuilt from source.
 **This repo is the recipe:** `serve.sh` + `patches/` reproduce the serving stack; `tools/` holds the drafter quantizer and the
 bench/stress scripts; `results/` the measured rows.
